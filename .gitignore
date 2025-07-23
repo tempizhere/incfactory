@@ -1,0 +1,61 @@
+# Go-specific
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/vendor/
+/go.sum
+/go.mod.sum
+*.test
+*.prof
+*.out
+
+# Environment files with secrets
+.env
+env-old
+
+# Logs
+*.log
+logs/
+
+#Backup files
+/.backup/
+
+# Temporary files
+*.swp
+*.swo
+*.tmp
+*.bak
+*~
+
+# IDE and editor files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Build artifacts for all cmd directories
+/cmd/*/processor
+/cmd/*/assistant
+/cmd/*/fetcher
+/cmd/*/search
+
+# Coverage and test output
+/coverage.out
+/test.out
+
+# SQL temporary files
+*.sql.bak
+*.sql~
+
+# Backup files
+.backup/
+
+# TODO
+TODO
