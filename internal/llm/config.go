@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	embeddingClient        = &http.Client{Timeout: 120 * time.Second}
+	embeddingClient        *http.Client
 	embeddingHost          string
 	embeddingAPIKey        string
 	embeddingProvider      string
@@ -41,6 +41,17 @@ func Init(embHost, embAPIKey, embProvider, embModel, compHost, compAPIKey, compP
 	embeddingMaxRetries = embMaxRetries
 	embeddingRetryDelay = embRetryDelay
 	embeddingMaxTextLength = embMaxTextLength
+
+	// Создаем HTTP клиент с пулом соединений для эмбеддингов
+	embeddingClient = &http.Client{
+		Timeout: 120 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+			DisableCompression:  false,
+		},
+	}
 
 	// Инициализация завершения текста
 	u, err = url.Parse(compHost)

@@ -325,24 +325,15 @@ func main() {
 						return
 					}
 
-					var embedding []float32
-					for attempt := 1; attempt <= config.EmbeddingMaxRetries; attempt++ {
-						var err error
-						embedding, err = llm.GenerateEmbedding(req)
-						if err == nil {
-							break
+					embedding, err := llm.GenerateEmbedding(req)
+					if err != nil {
+						fmt.Printf("Ошибка генерации эмбеддинга для %s %s: %v\n", req.SourceType, req.SourceID, err)
+						result.Payload, _ = json.Marshal(types.EmbeddingResponse{Error: fmt.Sprintf("Ошибка генерации эмбеддинга: %v", err)})
+						if err := queue.PublishLLMResult(result); err != nil {
+							fmt.Printf("Ошибка отправки ответа для request_id %s: %v\n", task.RequestID, err)
 						}
-						fmt.Printf("Ошибка генерации эмбеддинга для %s %s (попытка %d/%d): %v\n", req.SourceType, req.SourceID, attempt, config.EmbeddingMaxRetries, err)
-						if attempt < config.EmbeddingMaxRetries {
-							time.Sleep(time.Duration(config.EmbeddingRetryDelay*math.Pow(2, float64(attempt))) * time.Second)
-						} else {
-							result.Payload, _ = json.Marshal(types.EmbeddingResponse{Error: fmt.Sprintf("Ошибка генерации эмбеддинга после %d попыток: %v", config.EmbeddingMaxRetries, err)})
-							if err := queue.PublishLLMResult(result); err != nil {
-								fmt.Printf("Ошибка отправки ответа для request_id %s: %v\n", task.RequestID, err)
-							}
-							d.Nack(false, false)
-							return
-						}
+						d.Nack(false, false)
+						return
 					}
 
 					resp := types.EmbeddingResponse{
