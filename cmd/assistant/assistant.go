@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +75,32 @@ func float32SliceToString(slice []float32) string {
 	return fmt.Sprintf("[%s]", strings.Join(parts, ","))
 }
 
+// getEnvFloat возвращает float из ENV или значение по умолчанию
+func getEnvFloat(key string, def float64) float64 {
+	val := os.Getenv(key)
+	if val == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(val, 64)
+	if err != nil {
+		return def
+	}
+	return f
+}
+
+// getEnvInt возвращает int из ENV или значение по умолчанию
+func getEnvInt(key string, def int) int {
+	val := os.Getenv(key)
+	if val == "" {
+		return def
+	}
+	i, err := strconv.Atoi(val)
+	if err != nil || i <= 0 {
+		return def
+	}
+	return i
+}
+
 // searchSimilarCards выполняет поиск похожих карточек
 func searchSimilarCards(description, spaceID string, parentIDs []int, embedding []float32) ([]SearchResult, error) {
 	fmt.Printf("Начало поиска похожих карточек, space_id: %s, parentIDs: %v\n", spaceID, parentIDs)
@@ -81,28 +108,39 @@ func searchSimilarCards(description, spaceID string, parentIDs []int, embedding 
 		return nil, fmt.Errorf("некорректная размерность эмбеддинга: %d", len(embedding))
 	}
 
-	query := `
-		SELECT
-			c.card_id,
-			c.title,
-			s.summary,
-			s.solution,
-			s.category,
-			1 - (v.summary_embedding <=> $1) AS similarity
-		FROM incfactory_db.kaiten_cards c
-		LEFT JOIN incfactory_db.kaiten_card_summaries s ON c.card_id = s.card_id
-		LEFT JOIN incfactory_db.kaiten_summaries_vectors v ON c.card_id = v.card_id
-		WHERE c.space_id = $2`
-	args := []interface{}{float32SliceToString(embedding), spaceID}
+	// Параметры поиска из ENV с дефолтами
+	wSummary := getEnvFloat("SEARCH_SUMMARY_WEIGHT", 0.7)
+	wSolution := getEnvFloat("SEARCH_SOLUTION_WEIGHT", 0.3)
+	minSim := getEnvFloat("SEARCH_MIN_SIMILARITY", 0.25)
+	parentsBoost := getEnvFloat("SEARCH_PARENTS_BOOST", 0.05)
+	topK := getEnvInt("ASSISTANT_TOP_K", 5)
 
+	// Базовое выражение комбинированного скора
+	combinedExpr := `(
+		COALESCE(1 - (v.summary_embedding  <=> $1), 0) * $3 +
+		COALESCE(1 - (v.solution_embedding <=> $1), 0) * $4
+	)`
+	args := []interface{}{float32SliceToString(embedding), spaceID, wSummary, wSolution}
+
+	// При наличии родителей добавляем бонус
 	if len(parentIDs) > 0 {
-		query += ` AND c.parents @> $3`
-		args = append(args, pq.Array(parentIDs))
+		combinedExpr = combinedExpr + ` + CASE WHEN c.parents && $7 THEN $5 ELSE 0 END`
 	}
 
-	query += `
-		ORDER BY similarity DESC
-		LIMIT 5`
+	// Формируем основной запрос
+	query := "SELECT\n\t\tc.card_id,\n\t\tc.title,\n\t\ts.summary,\n\t\ts.solution,\n\t\ts.category,\n\t\t" + combinedExpr + " AS similarity\n" +
+		"FROM incfactory_db.kaiten_cards c\n" +
+		"LEFT JOIN incfactory_db.kaiten_card_summaries s ON c.card_id = s.card_id\n" +
+		"INNER JOIN incfactory_db.kaiten_summaries_vectors v ON c.card_id = v.card_id\n" +
+		"WHERE c.space_id = $2\n" +
+		"AND " + combinedExpr + " >= $6\n" +
+		fmt.Sprintf("ORDER BY similarity DESC\nLIMIT %d", topK)
+
+	// Добавляем оставшиеся аргументы: parentsBoost, minSim, parentIDs
+	args = append(args, parentsBoost, minSim)
+	if len(parentIDs) > 0 {
+		args = append(args, pq.Array(parentIDs))
+	}
 
 	fmt.Printf("Выполнение SQL-запроса: %s, args: %v\n", query, args)
 	rows, err := db.DB().Query(query, args...)
@@ -366,7 +404,8 @@ func consumeLLMResults() {
 		var llmResult types.LLMResult
 		if err := json.Unmarshal(msg.Body, &llmResult); err != nil {
 			fmt.Printf("Ошибка десериализации результата: %v\n", err)
-			msg.Nack(false, false)
+			// ACK, чтобы не застревало. Ошибку логируем.
+			msg.Ack(false)
 			continue
 		}
 		if llmResult.Source != "assistant" {

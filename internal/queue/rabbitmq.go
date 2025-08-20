@@ -19,8 +19,9 @@ type CardWithComments struct {
 }
 
 var (
-	conn *amqp.Connection
-	ch   *amqp.Channel
+	conn  *amqp.Connection
+	pubCh *amqp.Channel
+	confs chan amqp.Confirmation
 )
 
 // Init инициализирует подключение к RabbitMQ и объявляет очереди
@@ -44,11 +45,19 @@ func Init(host, port, user, pass string) error {
 		return fmt.Errorf("ошибка подключения к RabbitMQ после 3 попыток: %w", connErr)
 	}
 
-	ch, err = conn.Channel()
+	pubCh, err = conn.Channel()
 	if err != nil {
 		conn.Close()
 		return fmt.Errorf("ошибка открытия канала: %w", err)
 	}
+
+	// Publisher confirms
+	if err := pubCh.Confirm(false); err != nil {
+		pubCh.Close()
+		conn.Close()
+		return fmt.Errorf("не удалось включить publisher confirms: %w", err)
+	}
+	confs = pubCh.NotifyPublish(make(chan amqp.Confirmation, 1))
 
 	queues := []struct {
 		name string
@@ -126,7 +135,7 @@ func Init(host, port, user, pass string) error {
 	}
 
 	for _, q := range queues {
-		_, err = ch.QueueDeclare(
+		_, err = pubCh.QueueDeclare(
 			q.name,
 			true,
 			false,
@@ -135,7 +144,7 @@ func Init(host, port, user, pass string) error {
 			q.args,
 		)
 		if err != nil {
-			ch.Close()
+			pubCh.Close()
 			conn.Close()
 			return fmt.Errorf("ошибка объявления очереди %s: %w", q.name, err)
 		}
@@ -147,8 +156,8 @@ func Init(host, port, user, pass string) error {
 
 // Close закрывает соединение и канал
 func Close() {
-	if ch != nil {
-		if err := ch.Close(); err != nil {
+	if pubCh != nil {
+		if err := pubCh.Close(); err != nil {
 			fmt.Printf("Ошибка закрытия канала: %v\n", err)
 		}
 	}
@@ -165,21 +174,52 @@ func PublishCardWithComments(msg CardWithComments) error {
 	if err != nil {
 		return fmt.Errorf("ошибка сериализации: %w", err)
 	}
+	return publishWithConfirm("kaiten_transactions", body)
+}
 
-	err = ch.Publish(
-		"",
-		"kaiten_transactions",
-		false,
-		false,
-		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        body,
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("ошибка публикации в kaiten_transactions: %w", err)
+// publishWithConfirm публикует сообщение с персистентностью и подтверждениями
+func publishWithConfirm(queue string, body []byte) error {
+	if pubCh == nil {
+		return fmt.Errorf("канал публикации не инициализирован")
 	}
-	return nil
+	publish := func() error {
+		return pubCh.Publish(
+			"",
+			queue,
+			false,
+			false,
+			amqp.Publishing{
+				ContentType:  "application/json",
+				DeliveryMode: amqp.Persistent,
+				Body:         body,
+			},
+		)
+	}
+	const maxAttempts = 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := publish(); err != nil {
+			if attempt == maxAttempts {
+				return err
+			}
+			time.Sleep(time.Duration(attempt) * time.Second)
+			continue
+		}
+		select {
+		case conf := <-confs:
+			if conf.Ack {
+				return nil
+			}
+			if attempt == maxAttempts {
+				return fmt.Errorf("publisher nack")
+			}
+		case <-time.After(5 * time.Second):
+			if attempt == maxAttempts {
+				return fmt.Errorf("publisher confirm timeout")
+			}
+		}
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+	return fmt.Errorf("не удалось опубликовать сообщение")
 }
 
 // PublishLLMTask публикует запрос на обработку LLM
@@ -188,21 +228,7 @@ func PublishLLMTask(msg types.LLMTask) error {
 	if err != nil {
 		return fmt.Errorf("ошибка сериализации: %w", err)
 	}
-
-	err = ch.Publish(
-		"",
-		"llm_tasks",
-		false,
-		false,
-		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        body,
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("ошибка публикации в llm_tasks: %w", err)
-	}
-	return nil
+	return publishWithConfirm("llm_tasks", body)
 }
 
 // PublishLLMResult публикует результат обработки LLM
@@ -211,26 +237,25 @@ func PublishLLMResult(msg types.LLMResult) error {
 	if err != nil {
 		return fmt.Errorf("ошибка сериализации: %w", err)
 	}
+	return publishWithConfirm("llm_results", body)
+}
 
-	err = ch.Publish(
-		"",
-		"llm_results",
-		false,
-		false,
-		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        body,
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("ошибка публикации в llm_results: %w", err)
-	}
-	return nil
+// PublishToQueue публикует произвольное сообщение в указанную очередь
+func PublishToQueue(queueName string, body []byte) error {
+	return publishWithConfirm(queueName, body)
 }
 
 // ConsumeCardWithComments потребляет сообщения с карточками и комментариями
 func ConsumeCardWithComments() (<-chan amqp.Delivery, error) {
-	msgs, err := ch.Consume(
+	consCh, err := conn.Channel()
+	if err != nil {
+		return nil, fmt.Errorf("ошибка открытия канала: %w", err)
+	}
+	if err := consCh.Qos(getPrefetch(), 0, false); err != nil {
+		consCh.Close()
+		return nil, fmt.Errorf("ошибка установки QoS: %w", err)
+	}
+	msgs, err := consCh.Consume(
 		"kaiten_transactions",
 		"",
 		false,
@@ -240,6 +265,7 @@ func ConsumeCardWithComments() (<-chan amqp.Delivery, error) {
 		nil,
 	)
 	if err != nil {
+		consCh.Close()
 		return nil, fmt.Errorf("ошибка регистрации потребителя kaiten_transactions: %w", err)
 	}
 	return msgs, nil
@@ -247,7 +273,15 @@ func ConsumeCardWithComments() (<-chan amqp.Delivery, error) {
 
 // ConsumeLLMTasks потребляет запросы на обработку LLM
 func ConsumeLLMTasks() (<-chan amqp.Delivery, error) {
-	msgs, err := ch.Consume(
+	consCh, err := conn.Channel()
+	if err != nil {
+		return nil, fmt.Errorf("ошибка открытия канала: %w", err)
+	}
+	if err := consCh.Qos(getPrefetch(), 0, false); err != nil {
+		consCh.Close()
+		return nil, fmt.Errorf("ошибка установки QoS: %w", err)
+	}
+	msgs, err := consCh.Consume(
 		"llm_tasks",
 		"",
 		false,
@@ -257,6 +291,7 @@ func ConsumeLLMTasks() (<-chan amqp.Delivery, error) {
 		nil,
 	)
 	if err != nil {
+		consCh.Close()
 		return nil, fmt.Errorf("ошибка регистрации потребителя llm_tasks: %w", err)
 	}
 	return msgs, nil
@@ -264,7 +299,15 @@ func ConsumeLLMTasks() (<-chan amqp.Delivery, error) {
 
 // ConsumeLLMResults потребляет результаты обработки LLM
 func ConsumeLLMResults() (<-chan amqp.Delivery, error) {
-	msgs, err := ch.Consume(
+	consCh, err := conn.Channel()
+	if err != nil {
+		return nil, fmt.Errorf("ошибка открытия канала: %w", err)
+	}
+	if err := consCh.Qos(getPrefetch(), 0, false); err != nil {
+		consCh.Close()
+		return nil, fmt.Errorf("ошибка установки QoS: %w", err)
+	}
+	msgs, err := consCh.Consume(
 		"llm_results",
 		"",
 		false,
@@ -274,7 +317,20 @@ func ConsumeLLMResults() (<-chan amqp.Delivery, error) {
 		nil,
 	)
 	if err != nil {
+		consCh.Close()
 		return nil, fmt.Errorf("ошибка регистрации потребителя llm_results: %w", err)
 	}
 	return msgs, nil
+}
+
+func getPrefetch() int {
+	val := os.Getenv("RABBITMQ_PREFETCH")
+	if val == "" {
+		return 10
+	}
+	n, err := strconv.Atoi(val)
+	if err != nil || n <= 0 {
+		return 10
+	}
+	return n
 }

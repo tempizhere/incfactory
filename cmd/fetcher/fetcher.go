@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/tempizhere/incfactory/internal/api"
 	"github.com/tempizhere/incfactory/internal/queue"
+	"golang.org/x/time/rate"
 )
 
 func main() {
@@ -80,12 +82,25 @@ func main() {
 
 	fmt.Printf("Получение карточек с %s...\n", startDate.Format("2006-01-02"))
 
+	// Kaiten rate limiter
+	rps := 1.0
+	if v := os.Getenv("KAITEN_RATE_LIMIT_RPS"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			rps = f
+		}
+	}
+	limiter := rate.NewLimiter(rate.Limit(rps), 1)
+
 	offset := 0
 	for {
+		// лимитируем запрос к карточкам
+		_ = limiter.Wait(context.Background())
 		cards, err := api.FetchCardBatch(config.SpaceID, config.ColumnID, limit, offset, startDate)
 		if err != nil {
 			fmt.Printf("Ошибка получения карточек (offset=%d): %v\n", offset, err)
-			return
+			// мягкий бэкофф и продолжение
+			time.Sleep(2 * time.Second)
+			continue
 		}
 
 		if len(cards) == 0 {
@@ -95,6 +110,8 @@ func main() {
 
 		fmt.Printf("Получено %d карточек в партии (offset=%d).\n", len(cards), offset)
 		for _, card := range cards {
+			// лимитируем запрос к комментариям
+			_ = limiter.Wait(context.Background())
 			comments, err := api.FetchComments(card.ID)
 			if err != nil {
 				fmt.Printf("Ошибка получения комментариев для карточки %d: %v\n", card.ID, err)
@@ -145,6 +162,8 @@ func main() {
 			}
 		}
 		offset += limit
+		// короткая пауза между страницами
+		time.Sleep(200 * time.Millisecond)
 		if len(cards) < limit {
 			fmt.Println("Получено меньше карточек, чем лимит, конец результатов.")
 			break

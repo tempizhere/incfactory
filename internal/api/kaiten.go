@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -41,9 +43,11 @@ type Author struct {
 }
 
 var (
-	httpClient = &http.Client{Timeout: 30 * time.Second}
-	apiToken   string
-	baseURL    string
+	httpClient           *http.Client
+	apiToken             string
+	baseURL              string
+	kaitenMaxRetries     int
+	kaitenRetryBaseDelay float64
 )
 
 func Init(kaitenHost, kaitenAPIKey string) {
@@ -53,26 +57,105 @@ func Init(kaitenHost, kaitenAPIKey string) {
 	} else {
 		apiToken = kaitenAPIKey
 	}
+
+	// HTTP client with connection pooling
+	httpClient = &http.Client{
+		Timeout: 60 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+
+	// Retry config from ENV
+	kaitenMaxRetries = 5
+	if v := strings.TrimSpace(getEnv("KAITEN_MAX_RETRIES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			kaitenMaxRetries = n
+		}
+	}
+	kaitenRetryBaseDelay = 1.0
+	if v := strings.TrimSpace(getEnv("KAITEN_RETRY_BASE_DELAY")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			kaitenRetryBaseDelay = f
+		}
+	}
 }
 
-func doRequest(method, urlStr string) (*http.Response, error) {
-	req, err := http.NewRequest(method, urlStr, nil)
-	if err != nil {
-		return nil, fmt.Errorf("ошибка создания запроса: %w", err)
-	}
-	req.Header.Set("Authorization", apiToken)
-	req.Header.Set("Content-Type", "application/json")
+func getEnv(k string) string { return os.Getenv(k) }
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("ошибка выполнения запроса: %w", err)
+func parseRetryAfter(v string) (time.Duration, bool) {
+	if v == "" {
+		return 0, false
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		return nil, fmt.Errorf("ошибка API (%d): %s", resp.StatusCode, string(body))
+	if s, err := strconv.Atoi(v); err == nil && s >= 0 {
+		return time.Duration(s) * time.Second, true
 	}
-	return resp, nil
+	if t, err := time.Parse(time.RFC1123, v); err == nil {
+		d := time.Until(t)
+		if d > 0 {
+			return d, true
+		}
+	}
+	return 0, false
+}
+
+func backoffDelay(base float64, attempt int) time.Duration {
+	// экспоненциальный рост: base * 2^(attempt-1)
+	d := base * math.Pow(2, float64(attempt-1))
+	if d < 0.1 {
+		d = 0.1
+	}
+	if d > 30 {
+		d = 30
+	}
+	// jitter +-25%
+	jitter := d * 0.25
+	return time.Duration((d - jitter + (2*jitter)*randFloat()) * float64(time.Second))
+}
+
+func randFloat() float64 { return float64(time.Now().UnixNano()%9973) / 9973.0 }
+
+func doRequest(method, urlStr string) (*http.Response, error) {
+	var lastErr error
+	for attempt := 1; attempt <= kaitenMaxRetries; attempt++ {
+		req, err := http.NewRequest(method, urlStr, nil)
+		if err != nil {
+			return nil, fmt.Errorf("ошибка создания запроса: %w", err)
+		}
+		req.Header.Set("Authorization", apiToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("ошибка выполнения запроса: %w", err)
+		} else if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return resp, nil
+		} else {
+			// Read body for logging and close
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+				lastErr = fmt.Errorf("ошибка API (%d): %s", resp.StatusCode, string(body))
+				// Retry with Retry-After if present
+				if ra, ok := parseRetryAfter(resp.Header.Get("Retry-After")); ok {
+					time.Sleep(ra)
+				} else {
+					time.Sleep(backoffDelay(kaitenRetryBaseDelay, attempt))
+				}
+				continue
+			}
+			// Non-retryable 4xx
+			return nil, fmt.Errorf("ошибка API (%d): %s", resp.StatusCode, string(body))
+		}
+		// network error branch: backoff
+		if attempt < kaitenMaxRetries {
+			time.Sleep(backoffDelay(kaitenRetryBaseDelay, attempt))
+			continue
+		}
+	}
+	return nil, lastErr
 }
 
 func FetchCardBatch(spaceID, columnID string, limit, offset int, startDate time.Time) ([]Card, error) {

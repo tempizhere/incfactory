@@ -21,6 +21,32 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// getXDeathCount возвращает количество предыдущих доставок из заголовков RabbitMQ (x-death)
+func getXDeathCount(headers amqp.Table) int {
+	if headers == nil {
+		return 0
+	}
+	if raw, ok := headers["x-death"]; ok {
+		if arr, ok := raw.([]interface{}); ok && len(arr) > 0 {
+			if m, ok := arr[0].(amqp.Table); ok {
+				if v, ok := m["count"]; ok {
+					switch t := v.(type) {
+					case int:
+						return t
+					case int64:
+						return int(t)
+					case int32:
+						return int(t)
+					case float64:
+						return int(t)
+					}
+				}
+			}
+		}
+	}
+	return 0
+}
+
 type Config struct {
 	RabbitMQHost           string
 	RabbitMQPort           string
@@ -43,6 +69,7 @@ type Config struct {
 	EmbeddingMaxTextLength int
 	LLMMaxTokens           int
 	LLMJsonParseRetries    int
+	MaxDeliveryRetries     int
 }
 
 type PromptConfig struct {
@@ -127,6 +154,11 @@ func main() {
 		fmt.Printf("Ошибка: %v\n", err)
 		return
 	}
+	config.MaxDeliveryRetries, err = parseIntEnv("RABBITMQ_MAX_DELIVERY_RETRIES", 5)
+	if err != nil {
+		fmt.Printf("Ошибка: %v\n", err)
+		return
+	}
 
 	if err := queue.Init(config.RabbitMQHost, config.RabbitMQPort, config.RabbitMQUser, config.RabbitMQPass); err != nil {
 		fmt.Printf("Ошибка инициализации RabbitMQ: %v\n", err)
@@ -161,7 +193,23 @@ func main() {
 				var task types.LLMTask
 				if err := json.Unmarshal(d.Body, &task); err != nil {
 					fmt.Printf("Ошибка десериализации LLM-запроса: %v\n", err)
-					d.Nack(false, false)
+					d.Ack(false)
+					return
+				}
+
+				// Лимит попыток доставки по x-death
+				if getXDeathCount(d.Headers) >= config.MaxDeliveryRetries {
+					fmt.Printf("Достигнут лимит доставок для request_id %s, отправляем в parking и завершаем.\n", task.RequestID)
+					// Публикуем результирующую ошибку и паркуем оригинал
+					result := types.LLMResult{RequestID: task.RequestID, Source: task.Source, Type: task.Type}
+					result.Payload, _ = json.Marshal(types.LLMResponse{Error: fmt.Sprintf("Превышен лимит повторов (%d)", config.MaxDeliveryRetries)})
+					if err := queue.PublishLLMResult(result); err != nil {
+						fmt.Printf("Ошибка публикации результата в превышении лимита для %s: %v\n", task.RequestID, err)
+					}
+					if err := queue.PublishToQueue("llm_tasks_parking", d.Body); err != nil {
+						fmt.Printf("Ошибка публикации в parking для %s: %v\n", task.RequestID, err)
+					}
+					d.Ack(false)
 					return
 				}
 
@@ -196,7 +244,7 @@ func main() {
 						if err := queue.PublishLLMResult(result); err != nil {
 							fmt.Printf("Ошибка отправки ответа для request_id %s: %v\n", task.RequestID, err)
 						}
-						d.Nack(false, false)
+						d.Ack(false)
 						return
 					}
 
@@ -205,7 +253,7 @@ func main() {
 						if err := queue.PublishLLMResult(result); err != nil {
 							fmt.Printf("Ошибка отправки ответа для request_id %s: %v\n", task.RequestID, err)
 						}
-						d.Nack(false, false)
+						d.Ack(false)
 						return
 					}
 
@@ -252,7 +300,7 @@ func main() {
 								if err := queue.PublishLLMResult(result); err != nil {
 									fmt.Printf("Ошибка отправки ответа для request_id %s: %v\n", task.RequestID, err)
 								}
-								d.Nack(false, false)
+								d.Ack(false)
 								return
 							}
 						}
@@ -312,7 +360,7 @@ func main() {
 						if err := queue.PublishLLMResult(result); err != nil {
 							fmt.Printf("Ошибка отправки ответа для request_id %s: %v\n", task.RequestID, err)
 						}
-						d.Nack(false, false)
+						d.Ack(false)
 						return
 					}
 
@@ -321,7 +369,7 @@ func main() {
 						if err := queue.PublishLLMResult(result); err != nil {
 							fmt.Printf("Ошибка отправки ответа для request_id %s: %v\n", task.RequestID, err)
 						}
-						d.Nack(false, false)
+						d.Ack(false)
 						return
 					}
 
@@ -332,7 +380,7 @@ func main() {
 						if err := queue.PublishLLMResult(result); err != nil {
 							fmt.Printf("Ошибка отправки ответа для request_id %s: %v\n", task.RequestID, err)
 						}
-						d.Nack(false, false)
+						d.Ack(false)
 						return
 					}
 
