@@ -132,6 +132,10 @@ func Init(host, port, user, pass string) error {
 				"x-message-ttl":             int32(ttl),
 			},
 		},
+		{
+			name: "llm_tasks_parking",
+			args: amqp.Table{},
+		},
 	}
 
 	for _, q := range queues {

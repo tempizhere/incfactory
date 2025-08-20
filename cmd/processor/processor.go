@@ -52,10 +52,10 @@ func cleanText(text string) string {
 	return strings.TrimSpace(text)
 }
 
-// handleError унифицирует обработку ошибок с логированием и Nack
+// handleError унифицирует обработку ошибок с логированием и ACK (чтобы не застревало)
 func handleError(d *amqp.Delivery, err error, contextID string, message string) {
 	fmt.Printf("%s: %v (message: %s)\n", contextID, err, string(d.Body))
-	d.Nack(false, false)
+	d.Ack(false) // ACK чтобы не застревало в очереди
 }
 
 // buildLLMRequest формирует сообщения для LLM-запроса
@@ -302,7 +302,7 @@ func main() {
 
 					if resp.Error != "" {
 						fmt.Printf("Ошибка обработки LLM-запроса для card_id %s: %s\n", resp.CardID, resp.Error)
-						d.Nack(false, false)
+						d.Ack(false) // ACK при ошибке LLM, чтобы не ретраить бесконечно
 						return
 					}
 
@@ -355,7 +355,7 @@ func main() {
 
 					if resp.Error != "" {
 						fmt.Printf("Ошибка обработки запроса на эмбеддинг %s %s: %s\n", resp.SourceType, resp.SourceID, resp.Error)
-						d.Nack(false, false)
+						d.Ack(false) // ACK при ошибке эмбеддинга, чтобы не ретраить бесконечно
 						return
 					}
 
@@ -372,13 +372,13 @@ func main() {
 						}
 					default:
 						fmt.Printf("Недопустимый source_type: %s\n", resp.SourceType)
-						d.Nack(false, false)
+						d.Ack(false) // ACK при неверном типе
 						return
 					}
 
 				default:
 					fmt.Printf("Недопустимый тип результата: %s\n", llmResult.Type)
-					d.Nack(false, false)
+					d.Ack(false) // ACK при неверном типе
 					return
 				}
 
