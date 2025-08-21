@@ -59,6 +59,7 @@ func Init(host, port, user, pass string) error {
 	}
 	confs = pubCh.NotifyPublish(make(chan amqp.Confirmation, 1))
 
+	// НОВАЯ УПРОЩЕННАЯ СХЕМА ОЧЕРЕДЕЙ
 	queues := []struct {
 		name string
 		args amqp.Table
@@ -109,27 +110,31 @@ func Init(host, port, user, pass string) error {
 				"x-message-ttl":             int32(ttl),
 			},
 		},
+		// ВОССТАНАВЛИВАЕМ ПРАВИЛЬНУЮ АРХИТЕКТУРУ - РАЗДЕЛЕНИЕ РЕЗУЛЬТАТОВ
 		{
-			name: "llm_results",
+			name: "llm_results_assistant",
 			args: amqp.Table{
 				"x-dead-letter-exchange":    "",
-				"x-dead-letter-routing-key": "llm_results_dlq",
+				"x-dead-letter-routing-key": "llm_results_assistant_dlq",
 			},
 		},
 		{
-			name: "llm_results_dlq",
+			name: "llm_results_assistant_dlq",
 			args: amqp.Table{
-				"x-dead-letter-exchange":    "",
-				"x-dead-letter-routing-key": "llm_results_retry",
-				"x-message-ttl":             int32(ttl),
+				"x-message-ttl": int32(ttl),
 			},
 		},
 		{
-			name: "llm_results_retry",
+			name: "llm_results_processor",
 			args: amqp.Table{
 				"x-dead-letter-exchange":    "",
-				"x-dead-letter-routing-key": "llm_results",
-				"x-message-ttl":             int32(ttl),
+				"x-dead-letter-routing-key": "llm_results_processor_dlq",
+			},
+		},
+		{
+			name: "llm_results_processor_dlq",
+			args: amqp.Table{
+				"x-message-ttl": int32(ttl),
 			},
 		},
 		{
@@ -138,13 +143,14 @@ func Init(host, port, user, pass string) error {
 		},
 	}
 
+	// Объявляем очереди
 	for _, q := range queues {
-		_, err = pubCh.QueueDeclare(
+		_, err := pubCh.QueueDeclare(
 			q.name,
-			true,
-			false,
-			false,
-			false,
+			true,  // durable
+			false, // auto-deleted
+			false, // exclusive
+			false, // no-wait
 			q.args,
 		)
 		if err != nil {
@@ -158,30 +164,17 @@ func Init(host, port, user, pass string) error {
 	return nil
 }
 
-// Close закрывает соединение и канал
+// Close закрывает соединение с RabbitMQ
 func Close() {
 	if pubCh != nil {
-		if err := pubCh.Close(); err != nil {
-			fmt.Printf("Ошибка закрытия канала: %v\n", err)
-		}
+		pubCh.Close()
 	}
 	if conn != nil {
-		if err := conn.Close(); err != nil {
-			fmt.Printf("Ошибка закрытия соединения: %v\n", err)
-		}
+		conn.Close()
 	}
 }
 
-// PublishCardWithComments публикует сообщение с карточкой и комментариями
-func PublishCardWithComments(msg CardWithComments) error {
-	body, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("ошибка сериализации: %w", err)
-	}
-	return publishWithConfirm("kaiten_transactions", body)
-}
-
-// publishWithConfirm публикует сообщение с персистентностью и подтверждениями
+// publishWithConfirm публикует сообщение с подтверждением
 func publishWithConfirm(queue string, body []byte) error {
 	if pubCh == nil {
 		return fmt.Errorf("канал публикации не инициализирован")
@@ -211,12 +204,15 @@ func publishWithConfirm(queue string, body []byte) error {
 		select {
 		case conf := <-confs:
 			if conf.Ack {
+				fmt.Printf("Сообщение подтверждено RabbitMQ для очереди %s\n", queue)
 				return nil
 			}
+			fmt.Printf("Получен NACK от RabbitMQ для очереди %s (попытка %d/%d)\n", queue, attempt, maxAttempts)
 			if attempt == maxAttempts {
 				return fmt.Errorf("publisher nack")
 			}
 		case <-time.After(5 * time.Second):
+			fmt.Printf("Timeout подтверждения от RabbitMQ для очереди %s (попытка %d/%d)\n", queue, attempt, maxAttempts)
 			if attempt == maxAttempts {
 				return fmt.Errorf("publisher confirm timeout")
 			}
@@ -235,13 +231,37 @@ func PublishLLMTask(msg types.LLMTask) error {
 	return publishWithConfirm("llm_tasks", body)
 }
 
+// PublishCardWithComments публикует карточку с комментариями в очередь kaiten_transactions
+func PublishCardWithComments(msg CardWithComments) error {
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("ошибка сериализации: %w", err)
+	}
+	return publishWithConfirm("kaiten_transactions", body)
+}
+
 // PublishLLMResult публикует результат обработки LLM
 func PublishLLMResult(msg types.LLMResult) error {
 	body, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("ошибка сериализации: %w", err)
 	}
-	return publishWithConfirm("llm_results", body)
+
+	// ВОССТАНАВЛИВАЕМ ПРАВИЛЬНУЮ ЛОГИКУ: Отправляем в соответствующую очередь по source
+	var queueName string
+	switch msg.Source {
+	case "assistant":
+		queueName = "llm_results_assistant"
+	case "processor":
+		queueName = "llm_results_processor"
+	default:
+		queueName = "llm_results_assistant" // fallback
+	}
+
+	fmt.Printf("Публикуем в очередь %s: request_id=%s, correlation_id=%s, type=%s, source=%s\n",
+		queueName, msg.RequestID, msg.CorrelationID, msg.Type, msg.Source)
+
+	return publishWithConfirm(queueName, body)
 }
 
 // PublishToQueue публикует произвольное сообщение в указанную очередь
@@ -301,8 +321,9 @@ func ConsumeLLMTasks() (<-chan amqp.Delivery, error) {
 	return msgs, nil
 }
 
-// ConsumeLLMResults потребляет результаты обработки LLM
+// ConsumeLLMResults потребляет результаты обработки LLM для assistant
 func ConsumeLLMResults() (<-chan amqp.Delivery, error) {
+	fmt.Printf("Создание потребителя для очереди llm_results_assistant\n")
 	consCh, err := conn.Channel()
 	if err != nil {
 		return nil, fmt.Errorf("ошибка открытия канала: %w", err)
@@ -311,9 +332,14 @@ func ConsumeLLMResults() (<-chan amqp.Delivery, error) {
 		consCh.Close()
 		return nil, fmt.Errorf("ошибка установки QoS: %w", err)
 	}
+
+	// Генерируем уникальный consumer tag
+	consumerTag := fmt.Sprintf("assistant-consumer-%d", time.Now().UnixNano())
+	fmt.Printf("Используем consumer tag: %s\n", consumerTag)
+
 	msgs, err := consCh.Consume(
-		"llm_results",
-		"",
+		"llm_results_assistant",
+		consumerTag,
 		false,
 		false,
 		false,
@@ -322,8 +348,42 @@ func ConsumeLLMResults() (<-chan amqp.Delivery, error) {
 	)
 	if err != nil {
 		consCh.Close()
-		return nil, fmt.Errorf("ошибка регистрации потребителя llm_results: %w", err)
+		return nil, fmt.Errorf("ошибка регистрации потребителя llm_results_assistant: %w", err)
 	}
+	fmt.Printf("Потребитель для очереди llm_results_assistant успешно создан с tag: %s\n", consumerTag)
+	return msgs, nil
+}
+
+// ConsumeLLMResultsProcessor потребляет результаты обработки LLM для processor
+func ConsumeLLMResultsProcessor() (<-chan amqp.Delivery, error) {
+	fmt.Printf("Создание потребителя для очереди llm_results_processor\n")
+	consCh, err := conn.Channel()
+	if err != nil {
+		return nil, fmt.Errorf("ошибка открытия канала: %w", err)
+	}
+	if err := consCh.Qos(getPrefetch(), 0, false); err != nil {
+		consCh.Close()
+		return nil, fmt.Errorf("ошибка установки QoS: %w", err)
+	}
+
+	// Генерируем уникальный consumer tag
+	consumerTag := fmt.Sprintf("processor-consumer-%d", time.Now().UnixNano())
+	fmt.Printf("Используем consumer tag: %s\n", consumerTag)
+
+	msgs, err := consCh.Consume(
+		"llm_results_processor",
+		consumerTag,
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		consCh.Close()
+		return nil, fmt.Errorf("ошибка регистрации потребителя llm_results_processor: %w", err)
+	}
+	fmt.Printf("Потребитель для очереди llm_results_processor успешно создан с tag: %s\n", consumerTag)
 	return msgs, nil
 }
 

@@ -316,11 +316,76 @@ func UpdateVectorSchemaIfNeeded(dim int) error {
 	return nil
 }
 
-// float32SliceToString преобразует массив float32 в строку
+// float32SliceToString преобразует массив float32 в строку для pgvector
 func float32SliceToString(slice []float32) string {
 	var parts []string
 	for _, v := range slice {
 		parts = append(parts, fmt.Sprintf("%f", v))
 	}
-	return strings.Join(parts, ",")
+	return fmt.Sprintf("[%s]", strings.Join(parts, ","))
+}
+
+// SearchResult представляет результат поиска похожих карточек
+type SearchResult struct {
+	ID         string
+	Title      string
+	Summary    string
+	Solution   string
+	Category   string
+	Similarity float32
+}
+
+// FindSimilarCards выполняет поиск похожих карточек по эмбеддингу
+func FindSimilarCards(embedding []float32, limit int) ([]SearchResult, error) {
+	if len(embedding) != 1024 {
+		return nil, fmt.Errorf("некорректная размерность эмбеддинга: %d", len(embedding))
+	}
+
+	// Параметры поиска
+	wSummary := 0.7
+	wSolution := 0.3
+	minSim := 0.25
+
+	// Формируем основной запрос
+	query := `
+		SELECT
+			c.card_id,
+			c.title,
+			s.summary,
+			s.solution,
+			s.category,
+			(
+				COALESCE(1 - (v.summary_embedding  <=> $1), 0) * $2::FLOAT +
+				COALESCE(1 - (v.solution_embedding <=> $1), 0) * $3::FLOAT
+			) AS similarity
+		FROM incfactory_db.kaiten_cards c
+		LEFT JOIN incfactory_db.kaiten_card_summaries s ON c.card_id = s.card_id
+		INNER JOIN incfactory_db.kaiten_summaries_vectors v ON c.card_id = v.card_id
+		WHERE (
+			COALESCE(1 - (v.summary_embedding  <=> $1), 0) * $2::FLOAT +
+			COALESCE(1 - (v.solution_embedding <=> $1), 0) * $3::FLOAT
+		) >= $4::FLOAT
+		ORDER BY similarity DESC
+		LIMIT $5`
+
+	// Преобразуем embedding в правильный формат для pgvector
+	embeddingStr := float32SliceToString(embedding)
+	args := []interface{}{embeddingStr, wSummary, wSolution, minSim, limit}
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка поиска: %w", err)
+	}
+	defer rows.Close()
+
+	var results []SearchResult
+	for rows.Next() {
+		var r SearchResult
+		if err := rows.Scan(&r.ID, &r.Title, &r.Summary, &r.Solution, &r.Category, &r.Similarity); err != nil {
+			return nil, fmt.Errorf("ошибка чтения результата: %w", err)
+		}
+		results = append(results, r)
+	}
+
+	return results, nil
 }

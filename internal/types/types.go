@@ -43,16 +43,18 @@ type EmbeddingResponse struct {
 
 // LLMTask определяет универсальную структуру запроса для LLM-задач
 type LLMTask struct {
-	RequestID string      `json:"request_id"`
-	Source    string      `json:"source"`
-	Type      string      `json:"type"`
-	Payload   interface{} `json:"payload"`
+	RequestID     string      `json:"request_id"`
+	CorrelationID string      `json:"correlation_id"`
+	Source        string      `json:"source"`
+	Type          string      `json:"type"`
+	Payload       interface{} `json:"payload"`
 }
 
 // LLMResult определяет универсальную структуру результата LLM-задач
 type LLMResult struct {
-	RequestID string          `json:"request_id"`
-	Source    string          `json:"source"`
-	Type      string          `json:"type"`
-	Payload   json.RawMessage `json:"payload"`
+	RequestID     string          `json:"request_id"`
+	CorrelationID string          `json:"correlation_id"`
+	Source        string          `json:"source"`
+	Type          string          `json:"type"`
+	Payload       json.RawMessage `json:"payload"`
 }

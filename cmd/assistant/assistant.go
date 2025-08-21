@@ -6,433 +6,263 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"regexp"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/tempizhere/incfactory/internal/api"
+	"github.com/gorilla/mux"
+	"github.com/joho/godotenv"
 	"github.com/tempizhere/incfactory/internal/db"
 	"github.com/tempizhere/incfactory/internal/queue"
 	"github.com/tempizhere/incfactory/internal/types"
-
-	"github.com/gorilla/mux"
-	"github.com/joho/godotenv"
-	"github.com/lib/pq"
 )
 
-type PromptConfig struct {
-	Prompt           string  `json:"prompt"`
-	Temperature      float32 `json:"temperature,omitempty"`
-	TopP             float32 `json:"top_p,omitempty"`
-	FrequencyPenalty float32 `json:"frequency_penalty,omitempty"`
-	PresencePenalty  float32 `json:"presence_penalty,omitempty"`
+// НОВАЯ АРХИТЕКТУРА: Stateless без in-memory каналов
+type AssistantService struct {
+	mu sync.RWMutex
+	// Каналы для ожидания результатов по correlation_id
+	resultChans map[string]chan *types.LLMResult
+	resultMu    sync.RWMutex
 }
 
-type SearchResult struct {
-	CardID     string
-	Title      string
-	Summary    string
-	Solution   string
-	Category   string
-	Similarity float32
+var assistant = &AssistantService{
+	resultChans: make(map[string]chan *types.LLMResult),
 }
 
-type AssistantResult struct {
-	SimilarCards        []string `json:"similar_cards"`
-	RecommendedSolution string   `json:"recommended_solution"`
+// НОВАЯ ЛОГИКА: Простая функция для ожидания результата
+func (a *AssistantService) waitForLLMResult(ctx context.Context, correlationID string, timeout time.Duration) (*types.LLMResult, error) {
+	// Создаем канал для ожидания результата
+	resultChan := make(chan *types.LLMResult, 1)
+
+	// Регистрируем канал для этого correlation_id
+	a.resultMu.Lock()
+	a.resultChans[correlationID] = resultChan
+	a.resultMu.Unlock()
+
+	// Очищаем канал при выходе
+	defer func() {
+		a.resultMu.Lock()
+		delete(a.resultChans, correlationID)
+		a.resultMu.Unlock()
+	}()
+
+	// Ожидаем результат с таймаутом
+	select {
+	case result := <-resultChan:
+		return result, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("timeout ожидания результата для correlation_id: %s", correlationID)
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("timeout ожидания результата для correlation_id: %s", correlationID)
+	}
 }
 
-// cleanText очищает текст от Markdown и нормализует его
-func cleanText(text string) string {
-	text = strings.ReplaceAll(text, `\u003e`, ">")
-	text = strings.ReplaceAll(text, `\"`, "'")
-	text = strings.ReplaceAll(text, "**", "")
-	text = strings.ReplaceAll(text, "---", "")
-	text = strings.ReplaceAll(text, "##", "")
-	text = strings.ReplaceAll(text, "###", "")
-	text = strings.ReplaceAll(text, "\n", "; ")
-	text = strings.ReplaceAll(text, "\r", "")
-	text = strings.ReplaceAll(text, "\t", " ")
-	reSpaces := regexp.MustCompile(`\s+`)
-	text = reSpaces.ReplaceAllString(text, " ")
-	return strings.TrimSpace(text)
-}
+// НОВАЯ ЛОГИКА: Упрощенная обработка нового запроса
+func (a *AssistantService) processNewCard(w http.ResponseWriter, r *http.Request) {
+	fmt.Printf("🚀 Начало обработки нового запроса\n")
 
-// handleError логирует ошибку и отправляет HTTP-ответ
-func handleError(w http.ResponseWriter, err error, status int, msg string) {
-	fmt.Printf("Ошибка: %v\n", err)
-	http.Error(w, msg, status)
-}
-
-// float32SliceToString преобразует массив float32 в строку для pgvector
-func float32SliceToString(slice []float32) string {
-	var parts []string
-	for _, v := range slice {
-		parts = append(parts, fmt.Sprintf("%f", v))
-	}
-	return fmt.Sprintf("[%s]", strings.Join(parts, ","))
-}
-
-// getEnvFloat возвращает float из ENV или значение по умолчанию
-func getEnvFloat(key string, def float64) float64 {
-	val := os.Getenv(key)
-	if val == "" {
-		return def
-	}
-	f, err := strconv.ParseFloat(val, 64)
-	if err != nil {
-		return def
-	}
-	return f
-}
-
-// getEnvInt возвращает int из ENV или значение по умолчанию
-func getEnvInt(key string, def int) int {
-	val := os.Getenv(key)
-	if val == "" {
-		return def
-	}
-	i, err := strconv.Atoi(val)
-	if err != nil || i <= 0 {
-		return def
-	}
-	return i
-}
-
-// searchSimilarCards выполняет поиск похожих карточек
-func searchSimilarCards(description, spaceID string, parentIDs []int, embedding []float32) ([]SearchResult, error) {
-	fmt.Printf("Начало поиска похожих карточек, space_id: %s, parentIDs: %v\n", spaceID, parentIDs)
-	if len(embedding) != 1024 {
-		return nil, fmt.Errorf("некорректная размерность эмбеддинга: %d", len(embedding))
+	// Поддерживаем старый формат карточки
+	var card struct {
+		ID          int    `json:"id"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		BoardID     int    `json:"board_id"`
+		ColumnID    int    `json:"column_id"`
+		SpaceID     string `json:"space_id"`
+		Parents     []struct {
+			ID int `json:"id"`
+		} `json:"parents"`
+		Created string `json:"created"`
 	}
 
-	// Параметры поиска из ENV с дефолтами
-	wSummary := getEnvFloat("SEARCH_SUMMARY_WEIGHT", 0.7)
-	wSolution := getEnvFloat("SEARCH_SOLUTION_WEIGHT", 0.3)
-	minSim := getEnvFloat("SEARCH_MIN_SIMILARITY", 0.25)
-	parentsBoost := getEnvFloat("SEARCH_PARENTS_BOOST", 0.05)
-	topK := getEnvInt("ASSISTANT_TOP_K", 5)
-
-	// Базовое выражение комбинированного скора
-	combinedExpr := `(
-		COALESCE(1 - (v.summary_embedding  <=> $1), 0) * $3 +
-		COALESCE(1 - (v.solution_embedding <=> $1), 0) * $4
-	)`
-	args := []interface{}{float32SliceToString(embedding), spaceID, wSummary, wSolution}
-
-	// При наличии родителей добавляем бонус
-	if len(parentIDs) > 0 {
-		combinedExpr = combinedExpr + ` + CASE WHEN c.parents && $7 THEN $5 ELSE 0 END`
-	}
-
-	// Формируем основной запрос
-	query := "SELECT\n\t\tc.card_id,\n\t\tc.title,\n\t\ts.summary,\n\t\ts.solution,\n\t\ts.category,\n\t\t" + combinedExpr + " AS similarity\n" +
-		"FROM incfactory_db.kaiten_cards c\n" +
-		"LEFT JOIN incfactory_db.kaiten_card_summaries s ON c.card_id = s.card_id\n" +
-		"INNER JOIN incfactory_db.kaiten_summaries_vectors v ON c.card_id = v.card_id\n" +
-		"WHERE c.space_id = $2\n" +
-		"AND " + combinedExpr + " >= $6\n" +
-		fmt.Sprintf("ORDER BY similarity DESC\nLIMIT %d", topK)
-
-	// Добавляем оставшиеся аргументы: parentsBoost, minSim, parentIDs
-	args = append(args, parentsBoost, minSim)
-	if len(parentIDs) > 0 {
-		args = append(args, pq.Array(parentIDs))
-	}
-
-	fmt.Printf("Выполнение SQL-запроса: %s, args: %v\n", query, args)
-	rows, err := db.DB().Query(query, args...)
-	if err != nil {
-		fmt.Printf("Ошибка SQL-запроса: %v\n", err)
-		return nil, fmt.Errorf("ошибка поиска: %w", err)
-	}
-	defer rows.Close()
-
-	var results []SearchResult
-	for rows.Next() {
-		var r SearchResult
-		if err := rows.Scan(&r.CardID, &r.Title, &r.Summary, &r.Solution, &r.Category, &r.Similarity); err != nil {
-			fmt.Printf("Ошибка чтения результата: %v\n", err)
-			return nil, fmt.Errorf("ошибка чтения результата: %w", err)
-		}
-		results = append(results, r)
-	}
-	fmt.Printf("Найдено %d похожих карточек\n", len(results))
-	return results, nil
-}
-
-// handleNewCard обрабатывает HTTP-запрос
-func handleNewCard(w http.ResponseWriter, r *http.Request) {
-	var card api.Card
 	if err := json.NewDecoder(r.Body).Decode(&card); err != nil {
-		handleError(w, err, http.StatusBadRequest, "Неверный формат данных")
+		http.Error(w, "Ошибка парсинга JSON", http.StatusBadRequest)
 		return
 	}
 
 	if card.Description == "" {
-		handleError(w, fmt.Errorf("пустое описание"), http.StatusBadRequest, "Описание карточки пустое")
+		http.Error(w, "Описание карточки не может быть пустым", http.StatusBadRequest)
 		return
 	}
 
-	result, err := processNewCard(card)
-	if err != nil {
-		handleError(w, err, http.StatusInternalServerError, "Решение не найдено")
-		return
-	}
+	fmt.Printf("📝 Получена карточка: ID=%d, Title=%s, Description=%s\n", card.ID, card.Title, card.Description)
 
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if err := json.NewEncoder(w).Encode([]AssistantResult{result}); err != nil {
-		fmt.Printf("Ошибка кодирования ответа: %v\n", err)
-	}
-}
+	// Генерируем correlation ID для отслеживания
+	correlationID := fmt.Sprintf("assist-%d", time.Now().UnixNano())
+	fmt.Printf("🆔 Создан correlation_id: %s\n", correlationID)
 
-// processNewCard обрабатывает карточку
-func processNewCard(card api.Card) (AssistantResult, error) {
-	var result AssistantResult
-	result.SimilarCards = []string{} // Инициализация пустого массива
-
-	// Генерация эмбеддинга
+	// 1. Генерируем эмбеддинг
+	fmt.Printf("🔍 Генерация эмбеддинга для запроса\n")
 	embTask := types.LLMTask{
-		RequestID: fmt.Sprintf("assist-emb-%d", time.Now().UnixNano()),
-		Source:    "assistant",
-		Type:      "embedding",
+		RequestID:     fmt.Sprintf("assist-emb-%s", correlationID),
+		CorrelationID: correlationID,
+		Source:        "assistant",
+		Type:          "embedding",
 		Payload: types.EmbeddingRequest{
 			SourceID:   "query",
 			SourceType: "query",
-			Text:       cleanText(card.Description),
+			Text:       card.Description,
 		},
 	}
-	taskJSON, _ := json.Marshal(embTask)
-	fmt.Printf("Отправка embTask: %s\n", string(taskJSON))
+
+	fmt.Printf("📤 Отправка embTask: %s\n", embTask.RequestID)
 	if err := queue.PublishLLMTask(embTask); err != nil {
-		fmt.Printf("Ошибка PublishLLMTask: %v\n", err)
-		return result, fmt.Errorf("ошибка отправки задачи на эмбеддинг: %w", err)
+		fmt.Printf("❌ Ошибка отправки задачи эмбеддинга: %v\n", err)
+		http.Error(w, "Ошибка отправки задачи", http.StatusInternalServerError)
+		return
 	}
-	fmt.Printf("Задача эмбеддинга отправлена\n")
+	fmt.Printf("✅ Задача эмбеддинга отправлена, request_id: %s\n", embTask.RequestID)
 
-	// Ожидание эмбеддинга
-	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
+	// 2. Ожидаем эмбеддинг
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	responseChan := make(chan types.LLMResult, 1)
-	resultMu.Lock()
-	resultChans[embTask.RequestID] = responseChan
-	channelTimes[embTask.RequestID] = time.Now()
-	resultMu.Unlock()
-
-	// Гарантированная очистка канала эмбеддинга
-	defer func() {
-		resultMu.Lock()
-		delete(resultChans, embTask.RequestID)
-		delete(channelTimes, embTask.RequestID)
-		resultMu.Unlock()
-	}()
-
-	var embedding []float32
-	select {
-	case llmResult := <-responseChan:
-		fmt.Printf("llmResult: request_id=%s, source=%s, type=%s\n", llmResult.RequestID, llmResult.Source, llmResult.Type)
-		if llmResult.Type != "embedding" {
-			fmt.Printf("Неверный тип результата: %s\n", llmResult.Type)
-			return result, fmt.Errorf("неверный тип результата: %s", llmResult.Type)
-		}
-		var resp types.EmbeddingResponse
-		if err := json.Unmarshal(llmResult.Payload, &resp); err != nil {
-			fmt.Printf("Ошибка десериализации EmbeddingResponse: %v\n", err)
-			return result, fmt.Errorf("ошибка десериализации EmbeddingResponse: %w", err)
-		}
-		if resp.Error != "" {
-			fmt.Printf("Ошибка в EmbeddingResponse: %s\n", resp.Error)
-			return result, fmt.Errorf("ошибка эмбеддинга: %s", resp.Error)
-		}
-		embedding = resp.Embedding
-		fmt.Printf("Эмбеддинг получен: %v\n", embedding[:5])
-	case <-ctx.Done():
-		fmt.Printf("Таймаут ожидания эмбеддинга\n")
-		return result, fmt.Errorf("таймаут ожидания эмбеддинга")
-	}
-
-	// Подготовка parentIDs
-	parentIDs := make([]int, 0, len(card.Parents))
-	for _, p := range card.Parents {
-		if p.ID > 0 {
-			parentIDs = append(parentIDs, p.ID)
-		}
-	}
-	fmt.Printf("Подготовлены parentIDs: %v\n", parentIDs)
-
-	// Поиск похожих карточек
-	similarCards, err := searchSimilarCards(card.Description, card.SpaceID, parentIDs, embedding)
+	embResult, err := a.waitForLLMResult(ctx, correlationID, 60*time.Second)
 	if err != nil {
-		fmt.Printf("Ошибка поиска похожих карточек: %v\n", err)
-		return result, fmt.Errorf("ошибка поиска похожих карточек: %w", err)
+		fmt.Printf("❌ Ошибка получения эмбеддинга: %v\n", err)
+		http.Error(w, "Ошибка получения эмбеддинга", http.StatusInternalServerError)
+		return
 	}
 
-	// Формирование контекста
-	var context strings.Builder
+	fmt.Printf("✅ Получен эмбеддинг: %s\n", embResult.RequestID)
+
+	// 3. Десериализуем эмбеддинг
+	var embResponse types.EmbeddingResponse
+	if err := json.Unmarshal(embResult.Payload, &embResponse); err != nil {
+		fmt.Printf("❌ Ошибка десериализации эмбеддинга: %v\n", err)
+		http.Error(w, "Ошибка обработки эмбеддинга", http.StatusInternalServerError)
+		return
+	}
+
+	if embResponse.Error != "" {
+		fmt.Printf("❌ Ошибка в эмбеддинге: %s\n", embResponse.Error)
+		http.Error(w, "Ошибка генерации эмбеддинга", http.StatusInternalServerError)
+		return
+	}
+
+	// 4. Ищем похожие карточки
+	fmt.Printf("🔍 Поиск похожих карточек\n")
+	similarCards, err := db.FindSimilarCards(embResponse.Embedding, 5)
+	if err != nil {
+		fmt.Printf("❌ Ошибка поиска похожих карточек: %v\n", err)
+		http.Error(w, "Ошибка поиска похожих карточек", http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Printf("✅ Найдено %d похожих карточек\n", len(similarCards))
+
+	// 5. Формируем контекст для LLM
+	contextStr := ""
 	for _, card := range similarCards {
-		context.WriteString(fmt.Sprintf("Card ID: %s\nSummary: %s\nSolution: %s\n\n",
-			card.CardID, card.Summary, card.Solution))
-	}
-	fmt.Printf("Контекст сформирован: %s\n", context.String())
-
-	// Загрузка промпта
-	promptFile, err := os.ReadFile("config/assistant_prompt.json")
-	if err != nil {
-		fmt.Printf("Ошибка чтения assistant_prompt.json: %v\n", err)
-		return result, fmt.Errorf("ошибка чтения assistant_prompt.json: %v", err)
-	}
-	var promptConfig PromptConfig
-	if err := json.Unmarshal(promptFile, &promptConfig); err != nil {
-		fmt.Printf("Ошибка парсинга assistant_prompt.json: %v\n", err)
-		return result, fmt.Errorf("ошибка парсинга assistant_prompt.json: %v", err)
+		contextStr += fmt.Sprintf("Card ID: %s\nSummary: %s\nSolution: %s\n\n",
+			card.ID, card.Summary, card.Solution)
 	}
 
-	// Формирование LLM-запроса
-	prompt := strings.Replace(promptConfig.Prompt, "{query}", cleanText(card.Description), -1)
-	prompt = strings.Replace(prompt, "{context}", context.String(), -1)
-	messages := []types.Message{
-		{Role: "system", Content: prompt},
-		{Role: "user", Content: card.Description},
-	}
-
+	// 6. Генерируем рекомендацию
+	fmt.Printf("🤖 Генерация рекомендации\n")
 	recTask := types.LLMTask{
-		RequestID: fmt.Sprintf("assist-rec-%d", time.Now().UnixNano()),
-		Source:    "assistant",
-		Type:      "recommendation",
+		RequestID:     fmt.Sprintf("assist-rec-%s", correlationID),
+		CorrelationID: correlationID,
+		Source:        "assistant",
+		Type:          "recommendation",
 		Payload: types.LLMRequest{
-			CardID:   "assistant_query",
-			Messages: messages,
+			CardID: "assistant_query",
+			Messages: []types.Message{
+				{
+					Role:    "system",
+					Content: fmt.Sprintf("Ты — помощник для инженеров. Для карточки '%s' и контекста (%s) верни JSON в формате: [{ \"similar_cards\": [{\"card_id\": string, \"similarity\": string}, ...], \"recommended_solution\": \"строка до 500 символов\" }]. Правила: \n- similar_cards: до 5 объектов с card_id из контекста и их similarity (в формате '90%%'), упорядоченных по убыванию релевантности (наиболее соответствующая запросу карточка первая). \n- recommended_solution: извлеки технические решения (SQL-запросы, команды или действия, такие как 'поменять статус', 'установить через БД', 'снять блокировку', 'проставить через БД') из комментариев топ-5 похожих карточек. Нормализуй текст решений (удали лишние пробелы, переносы строк). Сравни решения по точному совпадению. Если ≥3 карточек имеют одинаковое решение, выбери его. Иначе выбери решение из карточки с наивысшей similarity. Игнорируй комментарии с только ссылками (URL), статусами без инструкций ('решается на L3', 'скорректировано', 'чек создан', 'чек добавлен', 'задача отменена', 'выполнено по запросу'), неинформативными записями ('пример для тс3') или описаниями без действий. Укажи card_id в скобках. Если решения нет, верни: \"Решение не найдено.\" \n- Ответ — строго валидный JSON, только указанная структура, без ```json, ```, без лишних символов, пробелов или переносов строк вне JSON.", card.Description, contextStr),
+				},
+				{
+					Role:    "user",
+					Content: card.Description,
+				},
+			},
 		},
 	}
-	taskJSON, _ = json.Marshal(recTask)
-	fmt.Printf("Отправка recTask: %s\n", string(taskJSON))
+
+	fmt.Printf("📤 Отправка recTask: %s\n", recTask.RequestID)
 	if err := queue.PublishLLMTask(recTask); err != nil {
-		fmt.Printf("Ошибка PublishLLMTask для рекомендации: %v\n", err)
-		return result, fmt.Errorf("ошибка отправки задачи на рекомендацию: %w", err)
+		fmt.Printf("❌ Ошибка отправки задачи рекомендации: %v\n", err)
+		http.Error(w, "Ошибка отправки задачи", http.StatusInternalServerError)
+		return
 	}
-	fmt.Printf("Задача рекомендации отправлена\n")
+	fmt.Printf("✅ Задача рекомендации отправлена, request_id: %s\n", recTask.RequestID)
 
-	// Ожидание рекомендации
-	ctx, cancel = context.WithTimeout(context.Background(), 600*time.Second)
-	defer cancel()
+	// 7. Ожидаем рекомендацию
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel2()
 
-	responseChan = make(chan types.LLMResult, 1)
-	resultMu.Lock()
-	resultChans[recTask.RequestID] = responseChan
-	channelTimes[recTask.RequestID] = time.Now()
-	resultMu.Unlock()
-
-	// Гарантированная очистка канала рекомендации
-	defer func() {
-		resultMu.Lock()
-		delete(resultChans, recTask.RequestID)
-		delete(channelTimes, recTask.RequestID)
-		resultMu.Unlock()
-	}()
-
-	select {
-	case llmResult := <-responseChan:
-		fmt.Printf("llmResult: request_id=%s, source=%s, type=%s\n", llmResult.RequestID, llmResult.Source, llmResult.Type)
-		if llmResult.Type != "recommendation" {
-			fmt.Printf("Неверный тип результата рекомендации: %s\n", llmResult.Type)
-			return result, fmt.Errorf("неверный тип результата рекомендации: %s", llmResult.Type)
-		}
-		var resp struct {
-			SimilarCards        []struct{ CardID, Similarity string } `json:"similar_cards"`
-			RecommendedSolution string                                `json:"recommended_solution"`
-		}
-		if err := json.Unmarshal(llmResult.Payload, &resp); err != nil {
-			fmt.Printf("Ошибка десериализации рекомендации: %v\n", err)
-			return result, fmt.Errorf("ошибка десериализации рекомендации: %w", err)
-		}
-		for _, sc := range resp.SimilarCards {
-			result.SimilarCards = append(result.SimilarCards, sc.CardID)
-		}
-		result.RecommendedSolution = resp.RecommendedSolution
-		if len(result.RecommendedSolution) > 500 {
-			result.RecommendedSolution = result.RecommendedSolution[:497] + "..."
-		}
-		if result.RecommendedSolution == "" {
-			result.RecommendedSolution = "Решение не найдено"
-		}
-		fmt.Printf("Рекомендация получена: %+v\n", result)
-		return result, nil
-	case <-ctx.Done():
-		fmt.Printf("Таймаут ожидания рекомендации\n")
-		return result, fmt.Errorf("таймаут ожидания рекомендации")
-	}
-}
-
-var (
-	resultChans  = make(map[string]chan types.LLMResult)
-	resultMu     sync.Mutex
-	channelTimes = make(map[string]time.Time) // Время создания каналов
-)
-
-// cleanupOldChannels периодически очищает неиспользуемые каналы
-func cleanupOldChannels() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		resultMu.Lock()
-		now := time.Now()
-		for requestID, createTime := range channelTimes {
-			// Удаляем каналы старше 15 минут
-			if now.Sub(createTime) > 15*time.Minute {
-				fmt.Printf("Очистка устаревшего канала для request_id: %s\n", requestID)
-				delete(resultChans, requestID)
-				delete(channelTimes, requestID)
-			}
-		}
-		resultMu.Unlock()
-	}
-}
-
-func consumeLLMResults() {
-	msgs, err := queue.ConsumeLLMResults()
+	recResult, err := a.waitForLLMResult(ctx2, correlationID, 120*time.Second)
 	if err != nil {
-		fmt.Printf("Ошибка ConsumeLLMResults: %v\n", err)
-		os.Exit(1)
+		fmt.Printf("❌ Ошибка получения рекомендации: %v\n", err)
+		http.Error(w, "Ошибка получения рекомендации", http.StatusInternalServerError)
+		return
 	}
 
-	for msg := range msgs {
-		fmt.Printf("Получено сообщение из llm_results: %s\n", string(msg.Body))
-		var llmResult types.LLMResult
-		if err := json.Unmarshal(msg.Body, &llmResult); err != nil {
-			fmt.Printf("Ошибка десериализации результата: %v\n", err)
-			// ACK, чтобы не застревало. Ошибку логируем.
-			msg.Ack(false)
-			continue
-		}
-		if llmResult.Source != "assistant" {
-			fmt.Printf("Неверный источник: %s\n", llmResult.Source)
-			msg.Ack(false)
-			continue
-		}
+	fmt.Printf("✅ Получена рекомендация: %s\n", recResult.RequestID)
 
-		resultMu.Lock()
-		if ch, ok := resultChans[llmResult.RequestID]; ok {
-			select {
-			case ch <- llmResult:
-				fmt.Printf("Сообщение отправлено в канал для request_id: %s\n", llmResult.RequestID)
-				msg.Ack(false)
-			default:
-				fmt.Printf("Канал для request_id %s переполнен\n", llmResult.RequestID)
-				// Канал переполнен, но это может быть нормально (duplicate message)
-				// Не отклоняем, чтобы не создавать бесконечный цикл
-				msg.Ack(false)
+	// 8. Отправляем ответ
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	response := map[string]interface{}{
+		"correlation_id": correlationID,
+		"request_id":     recResult.RequestID,
+		"result":         json.RawMessage(recResult.Payload),
+	}
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		fmt.Printf("❌ Ошибка кодирования ответа: %v\n", err)
+		http.Error(w, "Ошибка кодирования ответа", http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Printf("✅ Ответ отправлен для correlation_id: %s\n", correlationID)
+}
+
+// startConsumer запускает постоянный consumer для обработки результатов
+func (a *AssistantService) startConsumer() {
+	go func() {
+		for {
+			// Подключаемся к очереди результатов
+			msgs, err := queue.ConsumeLLMResults()
+			if err != nil {
+				fmt.Printf("❌ Ошибка подключения к llm_results: %v\n", err)
+				time.Sleep(5 * time.Second) // Ждем перед повторной попыткой
+				continue
 			}
-		} else {
-			fmt.Printf("Нет канала для request_id %s (возможно, уже обработан)\n", llmResult.RequestID)
-			// Канал не найден - это нормально, запрос уже мог быть обработан
-			msg.Ack(false)
+
+			fmt.Printf("🔄 Начинаем обработку сообщений из llm_results_assistant\n")
+
+			// Обрабатываем сообщения
+			for msg := range msgs {
+				var llmResult types.LLMResult
+				if err := json.Unmarshal(msg.Body, &llmResult); err != nil {
+					fmt.Printf("❌ Ошибка десериализации результата: %v\n", err)
+					msg.Ack(false)
+					continue
+				}
+
+				fmt.Printf("📨 Получен результат: correlation_id=%s, request_id=%s, type=%s\n",
+					llmResult.CorrelationID, llmResult.RequestID, llmResult.Type)
+
+				// Ищем канал для этого correlation_id
+				a.resultMu.RLock()
+				resultChan, exists := a.resultChans[llmResult.CorrelationID]
+				a.resultMu.RUnlock()
+
+				if exists {
+					fmt.Printf("✅ Найден канал для correlation_id: %s\n", llmResult.CorrelationID)
+					msg.Ack(false)
+					resultChan <- &llmResult
+				} else {
+					fmt.Printf("⚠️ Канал не найден для correlation_id: %s\n", llmResult.CorrelationID)
+					msg.Ack(false)
+				}
+			}
+
+			fmt.Printf("🔄 Переподключение к очереди llm_results_assistant\n")
 		}
-		resultMu.Unlock()
-	}
+	}()
 }
 
 func main() {
@@ -473,10 +303,13 @@ func main() {
 		}
 	}
 
+	fmt.Printf("Assistant подключается к RabbitMQ: %s:%s (user: %s)\n",
+		config.RabbitMQHost, config.RabbitMQPort, config.RabbitMQUser)
 	if err := queue.Init(config.RabbitMQHost, config.RabbitMQPort, config.RabbitMQUser, config.RabbitMQPass); err != nil {
 		fmt.Fprintf(os.Stderr, "Ошибка инициализации RabbitMQ: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Printf("Assistant успешно подключен к RabbitMQ\n")
 	defer queue.Close()
 
 	if err := db.Init(config.DBHost, config.DBPort, config.DBUser, config.DBPassword, config.DBName); err != nil {
@@ -485,13 +318,27 @@ func main() {
 	}
 	defer db.Close()
 
-	go consumeLLMResults()
-	go cleanupOldChannels() // Запуск очистки старых каналов
+	// Запускаем постоянный consumer для обработки результатов
+	fmt.Printf("🚀 Запуск постоянного consumer'а для обработки результатов\n")
+	assistant.startConsumer()
+
+	// НОВАЯ АРХИТЕКТУРА: Один постоянный consumer для всех запросов
+	fmt.Printf("🚀 Запуск Assistant с правильной архитектурой\n")
 
 	r := mux.NewRouter()
-	r.HandleFunc("/assistant", handleNewCard).Methods("POST")
+	r.HandleFunc("/assistant", assistant.processNewCard).Methods("POST")
+	r.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":    "ok",
+			"service":   "assistant",
+			"timestamp": time.Now().Unix(),
+		})
+	}).Methods("GET")
+
 	fmt.Fprintf(os.Stderr, "Запуск сервера на :8080\n")
-	fmt.Fprintf(os.Stderr, "Запущена очистка неиспользуемых каналов каждые 5 минут\n")
+	fmt.Fprintf(os.Stderr, "Assistant запущен с правильной архитектурой\n")
 	if err := http.ListenAndServe(":8080", r); err != nil {
 		fmt.Fprintf(os.Stderr, "Ошибка запуска сервера: %v\n", err)
 		os.Exit(1)

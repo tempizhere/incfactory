@@ -160,10 +160,14 @@ func main() {
 		return
 	}
 
+	fmt.Printf("LLM-service подключается к RabbitMQ: %s:%s (user: %s)\n",
+		config.RabbitMQHost, config.RabbitMQPort, config.RabbitMQUser)
 	if err := queue.Init(config.RabbitMQHost, config.RabbitMQPort, config.RabbitMQUser, config.RabbitMQPass); err != nil {
 		fmt.Printf("Ошибка инициализации RabbitMQ: %v\n", err)
 		return
 	}
+	fmt.Printf("LLM-service успешно подключен к RabbitMQ\n")
+
 	defer queue.Close()
 
 	llm.Init(config.EmbeddingHost, config.EmbeddingAPIKey, config.EmbeddingProvider, config.EmbeddingModel,
@@ -201,7 +205,7 @@ func main() {
 				if getXDeathCount(d.Headers) >= config.MaxDeliveryRetries {
 					fmt.Printf("Достигнут лимит доставок для request_id %s, отправляем в parking и завершаем.\n", task.RequestID)
 					// Публикуем результирующую ошибку и паркуем оригинал
-					result := types.LLMResult{RequestID: task.RequestID, Source: task.Source, Type: task.Type}
+					result := types.LLMResult{RequestID: task.RequestID, CorrelationID: task.CorrelationID, Source: task.Source, Type: task.Type}
 					result.Payload, _ = json.Marshal(types.LLMResponse{Error: fmt.Sprintf("Превышен лимит повторов (%d)", config.MaxDeliveryRetries)})
 					if err := queue.PublishLLMResult(result); err != nil {
 						fmt.Printf("Ошибка публикации результата в превышении лимита для %s: %v\n", task.RequestID, err)
@@ -214,9 +218,10 @@ func main() {
 				}
 
 				result := types.LLMResult{
-					RequestID: task.RequestID,
-					Source:    task.Source,
-					Type:      task.Type,
+					RequestID:     task.RequestID,
+					CorrelationID: task.CorrelationID,
+					Source:        task.Source,
+					Type:          task.Type,
 				}
 
 				var payloadBytes []byte
@@ -284,7 +289,9 @@ func main() {
 						temperature = 0.7
 					}
 					var response string
-					for parseAttempt := 1; parseAttempt <= config.LLMJsonParseRetries; parseAttempt++ {
+					var processingComplete bool
+
+					for parseAttempt := 1; parseAttempt <= config.LLMJsonParseRetries && !processingComplete; parseAttempt++ {
 						for attempt := 1; attempt <= config.LLMMaxRetries; attempt++ {
 							var err error
 							response, err = llm.GenerateCompletion(req.Messages, temperature, config.LLMMaxTokens,
@@ -306,51 +313,68 @@ func main() {
 						}
 
 						response = cleanLLMResponse(response)
-						re := regexp.MustCompile(`\[\{"summary":"((?:[^"\\]|\\(?:[^u]|u[0-9a-fA-F]{4})|\\")*)","solution":"((?:[^"\\]|\\(?:[^u]|u[0-9a-fA-F]{4})|\\")*)","category":"((?:[^"\\]|\\(?:[^u]|u[0-9a-fA-F]{4})|\\")*)"\}\]`)
-						if task.Type == "recommendation" {
-							re = regexp.MustCompile(`(?s)\[\{"similar_cards":\[(.*?)\],"recommended_solution":"((?:[^"\\]|\\(?:[^u]|u[0-9a-fA-F]{4})|\\")*)"\}\]`)
-						}
-						matches := re.FindStringSubmatch(response)
-						if task.Type == "summary" && len(matches) == 4 {
-							resp := types.LLMResponse{
-								CardID:   req.CardID,
-								Summary:  matches[1],
-								Solution: matches[2],
-								Category: matches[3],
-							}
-							if resp.Summary == "" || resp.Solution == "" || resp.Category == "" {
-								fmt.Printf("Пустой ответ LLM для request_id %s\n", task.RequestID)
-								if parseAttempt < config.LLMJsonParseRetries {
-									temperature = math.Max(0.1, temperature-0.2)
-									fmt.Printf("Повтор запроса для request_id %s с temperature=%.2f (попытка парсинга %d/%d)\n", task.RequestID, temperature, parseAttempt+1, config.LLMJsonParseRetries)
-									continue
-								}
-								result.Payload, _ = json.Marshal(types.LLMResponse{Error: "Пустой ответ LLM"})
-							} else {
-								result.Payload, _ = json.Marshal(resp)
-							}
-							break
-						} else if task.Type == "recommendation" && len(matches) == 3 {
-							resp := map[string]interface{}{
-								"similar_cards":        matches[1],
-								"recommended_solution": matches[2],
-							}
-							result.Payload, _ = json.Marshal(resp)
-							break
-						}
 
-						var summaryResp []map[string]interface{}
-						response = strings.TrimPrefix(response, "\uFEFF")
-						if err := json.Unmarshal([]byte(response), &summaryResp); err == nil && len(summaryResp) > 0 {
-							result.Payload, _ = json.Marshal(summaryResp[0])
+						if task.Type == "recommendation" {
+							// Для рекомендаций пытаемся парсить JSON напрямую
+							response = strings.TrimPrefix(response, "\uFEFF")
+							var recommendationResp []map[string]interface{}
+							if err := json.Unmarshal([]byte(response), &recommendationResp); err == nil && len(recommendationResp) > 0 {
+								fmt.Printf("JSON рекомендации успешно распарсен для request_id %s\n", task.RequestID)
+								result.Payload, _ = json.Marshal(recommendationResp[0])
+								processingComplete = true
+								break
+							}
+							fmt.Printf("Ошибка парсинга JSON рекомендации для request_id %s: %v, ответ: %s\n", task.RequestID, err, response)
+							if parseAttempt < config.LLMJsonParseRetries {
+								temperature = math.Max(0.1, temperature-0.2)
+								fmt.Printf("Повтор запроса для request_id %s с temperature=%.2f (попытка парсинга %d/%d)\n", task.RequestID, temperature, parseAttempt+1, config.LLMJsonParseRetries)
+								continue
+							}
+							result.Payload, _ = json.Marshal(map[string]interface{}{"error": "Некорректный формат JSON в ответе рекомендации"})
+							processingComplete = true
 							break
+						} else if task.Type == "summary" {
+							// Для summary используем регулярные выражения
+							re := regexp.MustCompile(`\[\{"summary":"((?:[^"\\]|\\(?:[^u]|u[0-9a-fA-F]{4})|\\")*)","solution":"((?:[^"\\]|\\(?:[^u]|u[0-9a-fA-F]{4})|\\")*)","category":"((?:[^"\\]|\\(?:[^u]|u[0-9a-fA-F]{4})|\\")*)"\}\]`)
+							matches := re.FindStringSubmatch(response)
+							if len(matches) == 4 {
+								resp := types.LLMResponse{
+									CardID:   req.CardID,
+									Summary:  matches[1],
+									Solution: matches[2],
+									Category: matches[3],
+								}
+								if resp.Summary == "" || resp.Solution == "" || resp.Category == "" {
+									fmt.Printf("Пустой ответ LLM для request_id %s\n", task.RequestID)
+									if parseAttempt < config.LLMJsonParseRetries {
+										temperature = math.Max(0.1, temperature-0.2)
+										fmt.Printf("Повтор запроса для request_id %s с temperature=%.2f (попытка парсинга %d/%d)\n", task.RequestID, temperature, parseAttempt+1, config.LLMJsonParseRetries)
+										continue
+									}
+									result.Payload, _ = json.Marshal(types.LLMResponse{Error: "Пустой ответ LLM"})
+								} else {
+									result.Payload, _ = json.Marshal(resp)
+								}
+								processingComplete = true
+								break
+							}
+
+							// Fallback для summary - пытаемся парсить как JSON массив
+							var summaryResp []map[string]interface{}
+							response = strings.TrimPrefix(response, "\uFEFF")
+							if err := json.Unmarshal([]byte(response), &summaryResp); err == nil && len(summaryResp) > 0 {
+								result.Payload, _ = json.Marshal(summaryResp[0])
+								processingComplete = true
+								break
+							}
+							if parseAttempt < config.LLMJsonParseRetries {
+								temperature = math.Max(0.1, temperature-0.2)
+								fmt.Printf("Повтор запроса для request_id %s с temperature=%.2f (попытка парсинга %d/%d)\n", task.RequestID, temperature, parseAttempt+1, config.LLMJsonParseRetries)
+								continue
+							}
+							result.Payload, _ = json.Marshal(types.LLMResponse{Error: "Некорректный формат JSON в ответе"})
+							processingComplete = true
 						}
-						if parseAttempt < config.LLMJsonParseRetries {
-							temperature = math.Max(0.1, temperature-0.2)
-							fmt.Printf("Повтор запроса для request_id %s с temperature=%.2f (попытка парсинга %d/%d)\n", task.RequestID, temperature, parseAttempt+1, config.LLMJsonParseRetries)
-							continue
-						}
-						result.Payload, _ = json.Marshal(types.LLMResponse{Error: "Некорректный формат JSON в ответе"})
 					}
 
 				case "embedding":
@@ -401,11 +425,13 @@ func main() {
 					return
 				}
 
+				fmt.Printf("📤 Публикация результата для request_id %s, correlation_id %s, type %s\n", task.RequestID, task.CorrelationID, task.Type)
 				if err := queue.PublishLLMResult(result); err != nil {
-					fmt.Printf("Ошибка отправки ответа для request_id %s: %v\n", task.RequestID, err)
+					fmt.Printf("❌ Ошибка отправки ответа для request_id %s: %v\n", task.RequestID, err)
 					d.Nack(false, false)
 					return
 				}
+				fmt.Printf("✅ Результат успешно опубликован для request_id %s с correlation_id %s\n", task.RequestID, task.CorrelationID)
 
 				d.Ack(false)
 			}(msg)

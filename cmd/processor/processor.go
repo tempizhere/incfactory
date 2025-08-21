@@ -269,9 +269,9 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		msgs, err := queue.ConsumeLLMResults()
+		msgs, err := queue.ConsumeLLMResultsProcessor()
 		if err != nil {
-			fmt.Printf("Ошибка регистрации потребителя llm_results: %v\n", err)
+			fmt.Printf("Ошибка регистрации потребителя llm_results_processor: %v\n", err)
 			return
 		}
 
