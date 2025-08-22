@@ -1,10 +1,6 @@
-.PHONY: build up down logs clean fetcher fetcher-date fetcher-custom health rebuild logs-assistant logs-llm logs-processor
+.PHONY: up down logs clean fetcher fetcher-date fetcher-custom health status restart pull update build dev-build dev-up dev-down
 
-# Сборка всех образов
-build:
-	docker-compose build
-
-# Запуск постоянных сервисов
+# Запуск всех сервисов
 up:
 	docker-compose up -d
 
@@ -28,39 +24,23 @@ logs-processor:
 
 # Запуск fetcher без параметров (последние 3 дня)
 fetcher:
-	docker-compose -f docker-compose.fetcher.yml --profile fetcher run --rm fetcher
+	docker-compose --profile fetcher run --rm fetcher
 
 # Запуск fetcher с текущей датой
 fetcher-date:
-	docker-compose -f docker-compose.fetcher.yml --profile fetcher run --rm fetcher --start-date $(shell date +%Y-%m-%d)
+	docker-compose --profile fetcher run --rm fetcher --start-date $(shell date +%Y-%m-%d)
 
 # Запуск fetcher с конкретной датой
 fetcher-custom:
-	docker-compose -f docker-compose.fetcher.yml --profile fetcher run --rm fetcher --start-date $(DATE)
-
-# Очистка
-clean:
-	docker-compose down --rmi all --volumes --remove-orphans
-
-# Health check
-health:
-	./scripts/health-check.sh
-
-# Пересборка и перезапуск
-rebuild:
-	docker-compose down
-	docker-compose build --no-cache
-	docker-compose up -d
-
-# Полный запуск
-start: up
-
-# Остановка
-stop: down
+	docker-compose --profile fetcher run --rm fetcher --start-date $(DATE)
 
 # Статус сервисов
 status:
 	docker-compose ps
+
+# Перезапуск всех сервисов
+restart:
+	docker-compose restart
 
 # Перезапуск конкретного сервиса
 restart-assistant:
@@ -71,3 +51,33 @@ restart-llm:
 
 restart-processor:
 	docker-compose restart processor
+
+# Обновление образов
+pull:
+	docker-compose pull
+
+# Обновление и перезапуск
+update:
+	docker-compose pull
+	docker-compose up -d
+
+# Health check
+health:
+	./scripts/health-check.sh
+
+# Очистка
+clean:
+	docker-compose down --rmi all --volumes --remove-orphans
+
+# Команды для разработки (с build)
+dev-build:
+	docker-compose -f docker-compose.dev.yml build
+
+dev-up:
+	docker-compose -f docker-compose.dev.yml up -d
+
+dev-down:
+	docker-compose -f docker-compose.dev.yml down
+
+# Сборка образов (для разработки)
+build: dev-build

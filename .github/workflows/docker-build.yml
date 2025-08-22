@@ -92,12 +92,14 @@ jobs:
     - name: Generate Docker Compose file for production
       if: github.event_name != 'pull_request'
       run: |
-        cat > docker-compose.prod.yml << EOF
+        cat > docker-compose.yml << EOF
         version: '3.8'
 
         services:
+          # Основные сервисы
           assistant:
             image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-assistant:${{ steps.meta.outputs.version }}
+            restart: unless-stopped
             ports:
               - "8080:8080"
             environment:
@@ -111,11 +113,19 @@ jobs:
               - DB_USER=\${DB_USER}
               - DB_PASSWORD=\${DB_PASSWORD}
               - DB_NAME=\${DB_NAME}
-            network_mode: host
-            restart: unless-stopped
+            depends_on:
+              - llm-service
+              - processor
+            healthcheck:
+              test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+              interval: 30s
+              timeout: 10s
+              retries: 3
+              start_period: 40s
 
           llm-service:
             image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-llm-service:${{ steps.meta.outputs.version }}
+            restart: unless-stopped
             environment:
               - SERVICE=llm-service
               - RABBITMQ_HOST=\${RABBITMQ_HOST}
@@ -130,21 +140,20 @@ jobs:
               - LLM_API_KEY=\${LLM_API_KEY}
               - LLM_PROVIDER=\${LLM_PROVIDER}
               - LLM_MODEL=\${LLM_MODEL}
-              - EMBEDDING_RATE_LIMIT=\${EMBEDDING_RATE_LIMIT}
-              - LLM_RATE_LIMIT=\${LLM_RATE_LIMIT}
-              - LLM_MAX_RETRIES=\${LLM_MAX_RETRIES}
-              - EMBEDDING_MAX_RETRIES=\${EMBEDDING_MAX_RETRIES}
-              - LLM_RETRY_DELAY=\${LLM_RETRY_DELAY}
-              - EMBEDDING_RETRY_DELAY=\${EMBEDDING_RETRY_DELAY}
-              - EMBEDDING_MAX_TEXT_LENGTH=\${EMBEDDING_MAX_TEXT_LENGTH}
-              - LLM_MAX_TOKENS=\${LLM_MAX_TOKENS}
-              - LLM_JSON_PARSE_RETRIES=\${LLM_JSON_PARSE_RETRIES}
-              - RABBITMQ_MAX_DELIVERY_RETRIES=\${RABBITMQ_MAX_DELIVERY_RETRIES}
-            network_mode: host
-            restart: unless-stopped
+              - EMBEDDING_RATE_LIMIT=\${EMBEDDING_RATE_LIMIT:-10}
+              - LLM_RATE_LIMIT=\${LLM_RATE_LIMIT:-5}
+              - LLM_MAX_RETRIES=\${LLM_MAX_RETRIES:-3}
+              - EMBEDDING_MAX_RETRIES=\${EMBEDDING_MAX_RETRIES:-3}
+              - LLM_RETRY_DELAY=\${LLM_RETRY_DELAY:-1.0}
+              - EMBEDDING_RETRY_DELAY=\${EMBEDDING_RETRY_DELAY:-1.0}
+              - EMBEDDING_MAX_TEXT_LENGTH=\${EMBEDDING_MAX_TEXT_LENGTH:-1000}
+              - LLM_MAX_TOKENS=\${LLM_MAX_TOKENS:-10000}
+              - LLM_JSON_PARSE_RETRIES=\${LLM_JSON_PARSE_RETRIES:-3}
+              - RABBITMQ_MAX_DELIVERY_RETRIES=\${RABBITMQ_MAX_DELIVERY_RETRIES:-5}
 
           processor:
             image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-processor:${{ steps.meta.outputs.version }}
+            restart: unless-stopped
             environment:
               - SERVICE=processor
               - RABBITMQ_HOST=\${RABBITMQ_HOST}
@@ -156,9 +165,8 @@ jobs:
               - DB_USER=\${DB_USER}
               - DB_PASSWORD=\${DB_PASSWORD}
               - DB_NAME=\${DB_NAME}
-            network_mode: host
-            restart: unless-stopped
 
+          # Fetcher (запуск по требованию)
           fetcher:
             image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-fetcher:${{ steps.meta.outputs.version }}
             environment:
@@ -171,17 +179,19 @@ jobs:
               - RABBITMQ_PASS=\${RABBITMQ_PASS}
               - SPACE_ID=\${SPACE_ID}
               - COLUMN_ID=\${COLUMN_ID}
-              - LIMIT=\${LIMIT}
-              - EXCLUDED_COMMENT_AUTHORS=\${EXCLUDED_COMMENT_AUTHORS}
-              - KAITEN_RATE_LIMIT_RPS=\${KAITEN_RATE_LIMIT_RPS}
-            network_mode: host
+              - LIMIT=\${LIMIT:-100}
+              - EXCLUDED_COMMENT_AUTHORS=\${EXCLUDED_COMMENT_AUTHORS:-bot,automation}
+              - KAITEN_RATE_LIMIT_RPS=\${KAITEN_RATE_LIMIT_RPS:-1.0}
             profiles:
               - fetcher
+            restart: "no"
+
+        networks: {}
         EOF
 
     - name: Upload Docker Compose file
       if: github.event_name != 'pull_request'
       uses: actions/upload-artifact@v4
       with:
-        name: docker-compose-prod
-        path: docker-compose.prod.yml
+        name: docker-compose
+        path: docker-compose.yml
