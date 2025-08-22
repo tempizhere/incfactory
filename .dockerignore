@@ -54,3 +54,5 @@ scripts/
 .cursor/
 
 # Go cache
+# Включаем go.sum для сборки
+!go.sum

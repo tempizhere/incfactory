@@ -6,7 +6,6 @@
 *.dylib
 /bin/
 /vendor/
-/go.sum
 /go.mod.sum
 *.test
 *.prof
