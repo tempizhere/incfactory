@@ -193,7 +193,7 @@ func SaveSummaryEmbedding(sourceID, sourceType string, embedding []float32, text
 	}
 
 	cardID := strings.TrimSuffix(sourceID, "_"+sourceType)
-	embeddingStr := fmt.Sprintf("[%s]", float32SliceToString(embedding))
+	embeddingStr := float32SliceToString(embedding)
 
 	if sourceType == "summary" {
 		_, err := db.Exec(`
@@ -206,11 +206,12 @@ func SaveSummaryEmbedding(sourceID, sourceType string, embedding []float32, text
 			return fmt.Errorf("ошибка сохранения эмбеддинга summary %s: %v", cardID, err)
 		}
 	} else {
+		// Для solution используем UPSERT чтобы не конфликтовать с summary
 		_, err := db.Exec(`
 			INSERT INTO incfactory_db.kaiten_summaries_vectors (card_id, solution_embedding, created_at)
 			VALUES ($1, $2, $3)
 			ON CONFLICT (card_id) DO UPDATE
-			SET solution_embedding = EXCLUDED.solution_embedding, created_at = EXCLUDED.created_at`,
+			SET solution_embedding = EXCLUDED.solution_embedding, created_at = GREATEST(kaiten_summaries_vectors.created_at, EXCLUDED.created_at)`,
 			cardID, embeddingStr, time.Now())
 		if err != nil {
 			return fmt.Errorf("ошибка сохранения эмбеддинга solution %s: %v", cardID, err)

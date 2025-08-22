@@ -239,13 +239,16 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		fmt.Printf("🔄 Создание потребителя для очереди kaiten_transactions\n")
 		msgs, err := queue.ConsumeCardWithComments()
 		if err != nil {
-			fmt.Printf("Ошибка регистрации потребителя kaiten_transactions: %v\n", err)
+			fmt.Printf("❌ Ошибка регистрации потребителя kaiten_transactions: %v\n", err)
 			return
 		}
+		fmt.Printf("✅ Потребитель для очереди kaiten_transactions успешно создан\n")
 
 		semaphore := make(chan struct{}, 50)
+		fmt.Printf("🔄 Ожидание сообщений из очереди kaiten_transactions\n")
 		for msg := range msgs {
 			semaphore <- struct{}{}
 			go func(d amqp.Delivery) {
@@ -256,6 +259,8 @@ func main() {
 					handleError(&d, err, fmt.Sprintf("Ошибка десериализации сообщения для карточки %d", cardMsg.Card.ID), "ошибка десериализации сообщения")
 					return
 				}
+				
+				fmt.Printf("📨 Получена карточка %d для обработки\n", cardMsg.Card.ID)
 
 				if err := processCardTransaction(&d, cardMsg); err != nil {
 					handleError(&d, err, fmt.Sprintf("Ошибка обработки карточки %d", cardMsg.Card.ID), err.Error())

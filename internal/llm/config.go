@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -17,7 +18,7 @@ var (
 	embeddingRetryDelay    float64
 	embeddingMaxTextLength int
 
-	completionClient   = &http.Client{Timeout: 120 * time.Second}
+	completionClient   *http.Client
 	completionHost     string
 	completionAPIKey   string
 	completionProvider string
@@ -50,6 +51,9 @@ func Init(embHost, embAPIKey, embProvider, embModel, compHost, compAPIKey, compP
 			MaxIdleConnsPerHost: 10,
 			IdleConnTimeout:     90 * time.Second,
 			DisableCompression:  false,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
 		},
 	}
 
@@ -65,4 +69,18 @@ func Init(embHost, embAPIKey, embProvider, embModel, compHost, compAPIKey, compP
 	completionAPIKey = compAPIKey
 	completionProvider = compProvider
 	completionModel = compModel
+
+	// Создаем HTTP клиент для завершения текста
+	completionClient = &http.Client{
+		Timeout: 120 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+			DisableCompression:  false,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
 }
