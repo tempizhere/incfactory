@@ -16,8 +16,11 @@ import (
 )
 
 func main() {
-	if err := godotenv.Load(); err != nil {
-		fmt.Println("Ошибка загрузки .env:", err)
+	// Загружаем .env только если основные переменные не установлены
+	if os.Getenv("KAITEN_HOST") == "" || os.Getenv("RABBITMQ_HOST") == "" {
+		if err := godotenv.Load(); err != nil {
+			fmt.Println("Ошибка загрузки .env:", err)
+		}
 	}
 
 	config := struct {

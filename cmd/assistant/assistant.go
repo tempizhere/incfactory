@@ -266,9 +266,11 @@ func (a *AssistantService) startConsumer() {
 }
 
 func main() {
-	if err := godotenv.Load(); err != nil {
-		fmt.Fprintf(os.Stderr, "Ошибка загрузки .env: %v\n", err)
-		os.Exit(1)
+	// Загружаем .env только если основные переменные не установлены
+	if os.Getenv("RABBITMQ_HOST") == "" || os.Getenv("DB_HOST") == "" {
+		if err := godotenv.Load(); err != nil {
+			fmt.Fprintf(os.Stderr, "Ошибка загрузки .env: %v\n", err)
+		}
 	}
 
 	config := struct {

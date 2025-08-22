@@ -148,3 +148,4 @@ CLAUDE.md
 README-Docker.md
 DOCKER-QUICKSTART.md
 CI-CD-SETUP.md
+docker-compose_dev.yml

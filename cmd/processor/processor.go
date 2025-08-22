@@ -181,9 +181,11 @@ func processCardTransaction(d *amqp.Delivery, cardMsg queue.CardWithComments) er
 }
 
 func main() {
-	if err := godotenv.Load(); err != nil {
-		fmt.Println("Ошибка загрузки .env:", err)
-		return
+	// Загружаем .env только если основные переменные не установлены
+	if os.Getenv("RABBITMQ_HOST") == "" || os.Getenv("DB_HOST") == "" {
+		if err := godotenv.Load(); err != nil {
+			fmt.Println("Ошибка загрузки .env:", err)
+		}
 	}
 
 	config := struct {
