@@ -1,0 +1,33 @@
+version: '3.8'
+
+# Переопределения для разработки
+services:
+  assistant:
+    volumes:
+      - ./config:/root/config:ro
+    environment:
+      - DEBUG=true
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  llm-service:
+    volumes:
+      - ./config:/root/config:ro
+    environment:
+      - DEBUG=true
+
+  processor:
+    volumes:
+      - ./config:/root/config:ro
+    environment:
+      - DEBUG=true
+
+  fetcher:
+    volumes:
+      - ./config:/root/config:ro
+    environment:
+      - DEBUG=true

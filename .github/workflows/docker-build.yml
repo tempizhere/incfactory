@@ -1,0 +1,187 @@
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix={{branch}}-
+
+    - name: Build and push Assistant image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./services/assistant/Dockerfile
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-assistant:${{ steps.meta.outputs.version }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build and push LLM Service image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./services/llm-service/Dockerfile
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-llm-service:${{ steps.meta.outputs.version }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build and push Processor image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./services/processor/Dockerfile
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-processor:${{ steps.meta.outputs.version }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build and push Fetcher image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./services/fetcher/Dockerfile
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-fetcher:${{ steps.meta.outputs.version }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Generate Docker Compose file for production
+      if: github.event_name != 'pull_request'
+      run: |
+        cat > docker-compose.prod.yml << EOF
+        version: '3.8'
+
+        services:
+          assistant:
+            image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-assistant:${{ steps.meta.outputs.version }}
+            ports:
+              - "8080:8080"
+            environment:
+              - SERVICE=assistant
+              - RABBITMQ_HOST=\${RABBITMQ_HOST}
+              - RABBITMQ_PORT=\${RABBITMQ_PORT}
+              - RABBITMQ_USER=\${RABBITMQ_USER}
+              - RABBITMQ_PASS=\${RABBITMQ_PASS}
+              - DB_HOST=\${DB_HOST}
+              - DB_PORT=\${DB_PORT}
+              - DB_USER=\${DB_USER}
+              - DB_PASSWORD=\${DB_PASSWORD}
+              - DB_NAME=\${DB_NAME}
+            network_mode: host
+            restart: unless-stopped
+
+          llm-service:
+            image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-llm-service:${{ steps.meta.outputs.version }}
+            environment:
+              - SERVICE=llm-service
+              - RABBITMQ_HOST=\${RABBITMQ_HOST}
+              - RABBITMQ_PORT=\${RABBITMQ_PORT}
+              - RABBITMQ_USER=\${RABBITMQ_USER}
+              - RABBITMQ_PASS=\${RABBITMQ_PASS}
+              - EMBEDDING_HOST=\${EMBEDDING_HOST}
+              - EMBEDDING_API_KEY=\${EMBEDDING_API_KEY}
+              - EMBEDDING_PROVIDER=\${EMBEDDING_PROVIDER}
+              - EMBEDDING_MODEL=\${EMBEDDING_MODEL}
+              - LLM_HOST=\${LLM_HOST}
+              - LLM_API_KEY=\${LLM_API_KEY}
+              - LLM_PROVIDER=\${LLM_PROVIDER}
+              - LLM_MODEL=\${LLM_MODEL}
+              - EMBEDDING_RATE_LIMIT=\${EMBEDDING_RATE_LIMIT}
+              - LLM_RATE_LIMIT=\${LLM_RATE_LIMIT}
+              - LLM_MAX_RETRIES=\${LLM_MAX_RETRIES}
+              - EMBEDDING_MAX_RETRIES=\${EMBEDDING_MAX_RETRIES}
+              - LLM_RETRY_DELAY=\${LLM_RETRY_DELAY}
+              - EMBEDDING_RETRY_DELAY=\${EMBEDDING_RETRY_DELAY}
+              - EMBEDDING_MAX_TEXT_LENGTH=\${EMBEDDING_MAX_TEXT_LENGTH}
+              - LLM_MAX_TOKENS=\${LLM_MAX_TOKENS}
+              - LLM_JSON_PARSE_RETRIES=\${LLM_JSON_PARSE_RETRIES}
+              - RABBITMQ_MAX_DELIVERY_RETRIES=\${RABBITMQ_MAX_DELIVERY_RETRIES}
+            network_mode: host
+            restart: unless-stopped
+
+          processor:
+            image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-processor:${{ steps.meta.outputs.version }}
+            environment:
+              - SERVICE=processor
+              - RABBITMQ_HOST=\${RABBITMQ_HOST}
+              - RABBITMQ_PORT=\${RABBITMQ_PORT}
+              - RABBITMQ_USER=\${RABBITMQ_USER}
+              - RABBITMQ_PASS=\${RABBITMQ_PASS}
+              - DB_HOST=\${DB_HOST}
+              - DB_PORT=\${DB_PORT}
+              - DB_USER=\${DB_USER}
+              - DB_PASSWORD=\${DB_PASSWORD}
+              - DB_NAME=\${DB_NAME}
+            network_mode: host
+            restart: unless-stopped
+
+          fetcher:
+            image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-fetcher:${{ steps.meta.outputs.version }}
+            environment:
+              - SERVICE=fetcher
+              - KAITEN_HOST=\${KAITEN_HOST}
+              - KAITEN_API_KEY=\${KAITEN_API_KEY}
+              - RABBITMQ_HOST=\${RABBITMQ_HOST}
+              - RABBITMQ_PORT=\${RABBITMQ_PORT}
+              - RABBITMQ_USER=\${RABBITMQ_USER}
+              - RABBITMQ_PASS=\${RABBITMQ_PASS}
+              - SPACE_ID=\${SPACE_ID}
+              - COLUMN_ID=\${COLUMN_ID}
+              - LIMIT=\${LIMIT}
+              - EXCLUDED_COMMENT_AUTHORS=\${EXCLUDED_COMMENT_AUTHORS}
+              - KAITEN_RATE_LIMIT_RPS=\${KAITEN_RATE_LIMIT_RPS}
+            network_mode: host
+            profiles:
+              - fetcher
+        EOF
+
+    - name: Upload Docker Compose file
+      if: github.event_name != 'pull_request'
+      uses: actions/upload-artifact@v4
+      with:
+        name: docker-compose-prod
+        path: docker-compose.prod.yml

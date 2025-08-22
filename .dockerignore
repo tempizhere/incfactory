@@ -1,0 +1,57 @@
+# Git
+.git
+.gitignore
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Documentation
+README.md
+*.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Backup files
+.backup/
+
+# Memory bank (не нужен в контейнере)
+memory-bank/
+
+# Custom modes (не нужен в контейнере)
+custom_modes/
+
+# TODO files
+TODO*
+*.todo
+
+# Environment files (кроме example)
+.env
+.env.local
+.env.production
+
+# Scripts (кроме docker/)
+scripts/
+!scripts/migrations.sql
+
+# Cursor rules (не нужны в контейнере)
+.cursor/
+
+# Go cache
+go.sum

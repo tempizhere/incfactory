@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  fetcher:
+    build:
+      context: .
+      dockerfile: services/fetcher/Dockerfile
+    environment:
+      - SERVICE=fetcher
+      - KAITEN_HOST=${KAITEN_HOST}
+      - KAITEN_API_KEY=${KAITEN_API_KEY}
+      - RABBITMQ_HOST=${RABBITMQ_HOST}
+      - RABBITMQ_PORT=${RABBITMQ_PORT}
+      - RABBITMQ_USER=${RABBITMQ_USER}
+      - RABBITMQ_PASS=${RABBITMQ_PASS}
+      - SPACE_ID=${SPACE_ID}
+      - COLUMN_ID=${COLUMN_ID}
+      - LIMIT=${LIMIT}
+      - EXCLUDED_COMMENT_AUTHORS=${EXCLUDED_COMMENT_AUTHORS}
+      - KAITEN_RATE_LIMIT_RPS=${KAITEN_RATE_LIMIT_RPS}
+    network_mode: host
+    profiles:
+      - fetcher

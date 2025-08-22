@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  assistant:
+    build:
+      context: .
+      dockerfile: services/assistant/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - SERVICE=assistant
+      - RABBITMQ_HOST=${RABBITMQ_HOST}
+      - RABBITMQ_PORT=${RABBITMQ_PORT}
+      - RABBITMQ_USER=${RABBITMQ_USER}
+      - RABBITMQ_PASS=${RABBITMQ_PASS}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+    network_mode: host
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    depends_on:
+      - llm-service
+      - processor
+
+  llm-service:
+    build:
+      context: .
+      dockerfile: services/llm-service/Dockerfile
+    environment:
+      - SERVICE=llm-service
+      - RABBITMQ_HOST=${RABBITMQ_HOST}
+      - RABBITMQ_PORT=${RABBITMQ_PORT}
+      - RABBITMQ_USER=${RABBITMQ_USER}
+      - RABBITMQ_PASS=${RABBITMQ_PASS}
+      - EMBEDDING_HOST=${EMBEDDING_HOST}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL}
+      - LLM_HOST=${LLM_HOST}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_PROVIDER=${LLM_PROVIDER}
+      - LLM_MODEL=${LLM_MODEL}
+      - EMBEDDING_RATE_LIMIT=${EMBEDDING_RATE_LIMIT}
+      - LLM_RATE_LIMIT=${LLM_RATE_LIMIT}
+      - LLM_MAX_RETRIES=${LLM_MAX_RETRIES}
+      - EMBEDDING_MAX_RETRIES=${EMBEDDING_MAX_RETRIES}
+      - LLM_RETRY_DELAY=${LLM_RETRY_DELAY}
+      - EMBEDDING_RETRY_DELAY=${EMBEDDING_RETRY_DELAY}
+      - EMBEDDING_MAX_TEXT_LENGTH=${EMBEDDING_MAX_TEXT_LENGTH}
+      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS}
+      - LLM_JSON_PARSE_RETRIES=${LLM_JSON_PARSE_RETRIES}
+      - RABBITMQ_MAX_DELIVERY_RETRIES=${RABBITMQ_MAX_DELIVERY_RETRIES}
+    network_mode: host
+    restart: unless-stopped
+
+  processor:
+    build:
+      context: .
+      dockerfile: services/processor/Dockerfile
+    environment:
+      - SERVICE=processor
+      - RABBITMQ_HOST=${RABBITMQ_HOST}
+      - RABBITMQ_PORT=${RABBITMQ_PORT}
+      - RABBITMQ_USER=${RABBITMQ_USER}
+      - RABBITMQ_PASS=${RABBITMQ_PASS}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+    network_mode: host
+    restart: unless-stopped
