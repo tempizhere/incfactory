@@ -1,40 +1,85 @@
 version: '3.8'
 
 services:
-  # Основные сервисы
+  # RabbitMQ
+  rabbitmq:
+    image: rabbitmq:4.1.0-management
+    container_name: rabbitmq
+    hostname: rabbitmq
+    restart: always
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASS}
+      - RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=-rabbit disk_free_limit 2147483648
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - incfactory_default
+
+  # Postgres + pgvector
+  kaiten-test-db:
+    image: pgvector/pgvector:pg17
+    container_name: kaiten-test-db
+    restart: always
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
+    ports:
+      - "5436:5432"
+    volumes:
+      - db:/var/lib/postgresql/data
+    networks:
+      - incfactory_default
+
+  # Assistant
   assistant:
-    image: tempizhere/incfactory-assistant:latest
+    image: tempizhere/incfactory-assistant:main
     restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
       - SERVICE=assistant
-      - RABBITMQ_HOST=${RABBITMQ_HOST}
-      - RABBITMQ_PORT=${RABBITMQ_PORT}
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
       - RABBITMQ_USER=${RABBITMQ_USER}
       - RABBITMQ_PASS=${RABBITMQ_PASS}
-      - DB_HOST=${DB_HOST}
-      - DB_PORT=${DB_PORT}
+      - DB_HOST=kaiten-test-db
+      - DB_PORT=5432
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
       - DB_NAME=${DB_NAME}
+    networks:
+      - incfactory_default
     depends_on:
       - llm-service
       - processor
+      - rabbitmq
+      - kaiten-test-db
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --tries=1
+        - --spider
+        - http://localhost:8080/health
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
 
+  # LLM-service
   llm-service:
-    image: tempizhere/incfactory-llm-service:latest
+    image: tempizhere/incfactory-llm-service:main
     restart: unless-stopped
     environment:
       - SERVICE=llm-service
-      - RABBITMQ_HOST=${RABBITMQ_HOST}
-      - RABBITMQ_PORT=${RABBITMQ_PORT}
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
       - RABBITMQ_USER=${RABBITMQ_USER}
       - RABBITMQ_PASS=${RABBITMQ_PASS}
       - EMBEDDING_HOST=${EMBEDDING_HOST}
@@ -55,31 +100,41 @@ services:
       - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-10000}
       - LLM_JSON_PARSE_RETRIES=${LLM_JSON_PARSE_RETRIES:-3}
       - RABBITMQ_MAX_DELIVERY_RETRIES=${RABBITMQ_MAX_DELIVERY_RETRIES:-5}
+    networks:
+      - incfactory_default
+    depends_on:
+      - rabbitmq
 
+  # Processor
   processor:
-    image: tempizhere/incfactory-processor:latest
+    image: tempizhere/incfactory-processor:main
     restart: unless-stopped
     environment:
       - SERVICE=processor
-      - RABBITMQ_HOST=${RABBITMQ_HOST}
-      - RABBITMQ_PORT=${RABBITMQ_PORT}
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
       - RABBITMQ_USER=${RABBITMQ_USER}
       - RABBITMQ_PASS=${RABBITMQ_PASS}
-      - DB_HOST=${DB_HOST}
-      - DB_PORT=${DB_PORT}
+      - DB_HOST=kaiten-test-db
+      - DB_PORT=5432
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
       - DB_NAME=${DB_NAME}
+    networks:
+      - incfactory_default
+    depends_on:
+      - rabbitmq
+      - kaiten-test-db
 
-  # Fetcher (запуск по требованию)
+  # Fetcher
   fetcher:
-    image: tempizhere/incfactory-fetcher:latest
+    image: tempizhere/incfactory-fetcher:main
     environment:
       - SERVICE=fetcher
       - KAITEN_HOST=${KAITEN_HOST}
       - KAITEN_API_KEY=${KAITEN_API_KEY}
-      - RABBITMQ_HOST=${RABBITMQ_HOST}
-      - RABBITMQ_PORT=${RABBITMQ_PORT}
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
       - RABBITMQ_USER=${RABBITMQ_USER}
       - RABBITMQ_PASS=${RABBITMQ_PASS}
       - SPACE_ID=${SPACE_ID}
@@ -87,8 +142,20 @@ services:
       - LIMIT=${LIMIT:-100}
       - EXCLUDED_COMMENT_AUTHORS=${EXCLUDED_COMMENT_AUTHORS:-bot,automation}
       - KAITEN_RATE_LIMIT_RPS=${KAITEN_RATE_LIMIT_RPS:-1.0}
+    networks:
+      - incfactory_default
     profiles:
       - fetcher
     restart: "no"
+    depends_on:
+      - rabbitmq
 
-networks: {}
+volumes:
+  db:
+    driver: local
+  rabbitmq_data:
+    driver: local
+
+networks:
+  incfactory_default:
+    external: true

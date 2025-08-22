@@ -1,7 +1,8 @@
 .PHONY: up down logs clean fetcher fetcher-date fetcher-custom health status restart pull update build dev-build dev-up dev-down
 
-# Запуск всех сервисов
+# Создание сети и запуск всех сервисов
 up:
+	docker network create incfactory_default || true
 	docker-compose up -d
 
 # Остановка сервисов
