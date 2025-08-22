@@ -37,7 +37,7 @@ services:
 
   # Assistant
   assistant:
-    image: tempizhere/incfactory-assistant:main
+    image: tempizhere/incfactory-assistant:latest
     restart: unless-stopped
     ports:
       - "8080:8080"
@@ -74,7 +74,7 @@ services:
 
   # LLM-service
   llm-service:
-    image: tempizhere/incfactory-llm-service:main
+    image: tempizhere/incfactory-llm-service:latest
     restart: unless-stopped
     environment:
       - SERVICE=llm-service
@@ -107,7 +107,7 @@ services:
 
   # Processor
   processor:
-    image: tempizhere/incfactory-processor:main
+    image: tempizhere/incfactory-processor:latest
     restart: unless-stopped
     environment:
       - SERVICE=processor
@@ -128,7 +128,7 @@ services:
 
   # Fetcher
   fetcher:
-    image: tempizhere/incfactory-fetcher:main
+    image: tempizhere/incfactory-fetcher:latest
     environment:
       - SERVICE=fetcher
       - KAITEN_HOST=${KAITEN_HOST}
